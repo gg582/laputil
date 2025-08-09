@@ -1,11 +1,11 @@
-obj-m := cpufreq_laputil.o
+obj-m += cpufreq_laputil.o
 
-KDIR := /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
+KVERSION = $(shell uname -r)
+
+KDIR = /lib/modules/$(KVERSION)/build
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-
