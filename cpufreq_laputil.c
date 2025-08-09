@@ -51,9 +51,9 @@ struct cs_dbs_tuners {
 };
 
 /* Conservative governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD      (75)
+#define DEF_FREQUENCY_UP_THRESHOLD      (65)
 #define DEF_FREQUENCY_DOWN_THRESHOLD    (10)
-#define DEF_FREQUENCY_STEP              (3)
+#define DEF_FREQUENCY_STEP              (1)
 #define DEF_SAMPLING_DOWN_FACTOR        (4)
 #define MAX_SAMPLING_DOWN_FACTOR        (10)
 
@@ -364,6 +364,9 @@ static int cs_start(struct cpufreq_policy *policy)
     dbs_info->requested_freq = policy->cur;
     dbs_info->prev_load = 0;
     dbs_info->idle_periods = 0;
+    unsigned int initial_freq = (policy->max + policy->min) / 2;
+    cpufreq_driver_target(policy, initial_freq, CPUFREQ_RELATION_H);
+    dbs_info->requested_freq = initial_freq;
 
     return 0;
 }
