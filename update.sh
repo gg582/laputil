@@ -16,14 +16,14 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Building DKMS module..."
-sudo dkms build -m "${MODULE_NAME}" -v "${MODULE_VERSION}" -k "$(uname -r)"
+sudo dkms build -m "${MODULE_NAME}" -v "${MODULE_VERSION}" -k "$(uname -r)" --force
 if [ $? -ne 0 ]; then
   echo "DKMS build failed."
   exit 1
 fi
 
 echo "Installing DKMS module..."
-sudo dkms install -m "${MODULE_NAME}" -v "${MODULE_VERSION}" -k "$(uname -r)"
+sudo dkms install -m "${MODULE_NAME}" -v "${MODULE_VERSION}" -k "$(uname -r)" --force
 if [ $? -ne 0 ]; then
   echo "DKMS install failed."
   exit 1

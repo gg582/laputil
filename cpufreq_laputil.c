@@ -19,6 +19,19 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
+/*
+ * This structure holds the previous state for each CPU core.
+ */
+struct cpu_dbs_info {
+    u64 prev_cpu_idle;
+    u64 prev_update_time;
+};
+
+/*
+ * Use a macro to declare a per-CPU variable of type 'struct cpu_dbs_info'.
+ */
+DEFINE_PER_CPU(struct cpu_dbs_info, cpu_dbs);
+
 /* Structures for the governor */
 struct cs_policy_dbs_info {
     struct cpufreq_policy *policy;
@@ -56,12 +69,47 @@ static inline unsigned int get_freq_step(struct cs_dbs_tuners *cs_tuners,
     return freq_step;
 }
 
-/* Placeholder for dbs_update: calculates CPU load */
 static unsigned int dbs_update(struct cpufreq_policy *policy)
 {
-    /* TODO: Implement actual CPU load calculation */
-    /* For now, return a dummy value */
-    return 50;
+    unsigned int load = 0;
+    unsigned int cpu;
+
+    for_each_cpu(cpu, policy->cpus) {
+        struct cpu_dbs_info *cdbs = per_cpu_ptr(&cpu_dbs, cpu);
+        u64 cur_idle_time;
+        time64_t update_time;
+        unsigned int time_elapsed, idle_time;
+        unsigned int cur_load_per_cpu;
+
+        // Get the current idle time and update time from the kernel
+        cur_idle_time = get_cpu_idle_time(cpu, &update_time, 0);
+
+        // Calculate the elapsed time since the last update
+        time_elapsed = (unsigned int)(update_time - cdbs->prev_update_time);
+
+        // Calculate the change in idle time during that period
+        idle_time = (unsigned int)(cur_idle_time - cdbs->prev_cpu_idle);
+
+        // Handle the case where no time has elapsed or idle time is invalid
+        if (unlikely(!time_elapsed || idle_time > time_elapsed)) {
+            cur_load_per_cpu = 100;
+        } else {
+            // Calculate the load percentage: 100 * (busy_time / total_time)
+            cur_load_per_cpu = 100 * (time_elapsed - idle_time) / time_elapsed;
+        }
+
+        // Store the current values for the next calculation
+        cdbs->prev_cpu_idle = cur_idle_time;
+        cdbs->prev_update_time = update_time;
+
+        load += cur_load_per_cpu;
+    }
+
+    // Return the average load for all CPUs in the policy
+    if (cpumask_weight(policy->cpus) > 0)
+        return load / cpumask_weight(policy->cpus);
+
+    return 0;
 }
 
 static unsigned int cs_dbs_update(struct cpufreq_policy *policy)
