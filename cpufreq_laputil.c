@@ -51,10 +51,10 @@ struct cs_dbs_tuners {
 };
 
 /* Conservative governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD      (65)
-#define DEF_FREQUENCY_DOWN_THRESHOLD    (20)
+#define DEF_FREQUENCY_UP_THRESHOLD      (75)
+#define DEF_FREQUENCY_DOWN_THRESHOLD    (15)
 #define DEF_FREQUENCY_STEP              (3)
-#define DEF_SAMPLING_DOWN_FACTOR        (4)
+#define DEF_SAMPLING_DOWN_FACTOR        (2)
 #define MAX_SAMPLING_DOWN_FACTOR        (10)
 
 static inline unsigned int get_freq_step(struct cs_dbs_tuners *cs_tuners,
@@ -392,7 +392,7 @@ static int cs_init(struct cpufreq_policy *policy)
     tuners->freq_step = DEF_FREQUENCY_STEP;
     tuners->up_threshold = DEF_FREQUENCY_UP_THRESHOLD;
     tuners->sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR;
-    tuners->ignore_nice_load = 0;
+    tuners->ignore_nice_load = 1;
     tuners->sampling_rate = 10; /* Default sampling rate in jiffies */
 
     dbs_info->policy = policy;
