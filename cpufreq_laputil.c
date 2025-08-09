@@ -51,12 +51,11 @@ struct cs_dbs_tuners {
 };
 
 /* Conservative governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD      (60)
-#define DEF_FREQUENCY_DOWN_THRESHOLD    (3)
+#define DEF_FREQUENCY_UP_THRESHOLD      (75)
+#define DEF_FREQUENCY_DOWN_THRESHOLD    (10)
 #define DEF_FREQUENCY_STEP              (3)
-#define DEF_SAMPLING_DOWN_FACTOR        (2)
+#define DEF_SAMPLING_DOWN_FACTOR        (4)
 #define MAX_SAMPLING_DOWN_FACTOR        (10)
-#define CPU_IDLE_RT_DOWN_THRESHOLD      (750)
 
 static inline unsigned int get_freq_step(struct cs_dbs_tuners *cs_tuners,
                                         struct cpufreq_policy *policy)
