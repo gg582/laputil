@@ -364,9 +364,6 @@ static int cs_start(struct cpufreq_policy *policy)
     dbs_info->requested_freq = policy->cur;
     dbs_info->prev_load = 0;
     dbs_info->idle_periods = 0;
-    unsigned int initial_freq = (policy->max + policy->min) / 2;
-    cpufreq_driver_target(policy, initial_freq, CPUFREQ_RELATION_H);
-    dbs_info->requested_freq = initial_freq;
 
     return 0;
 }
