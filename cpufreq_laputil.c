@@ -52,8 +52,8 @@ struct cs_dbs_tuners {
 
 /* Conservative governor macros */
 #define DEF_FREQUENCY_UP_THRESHOLD      (65)
-#define DEF_FREQUENCY_DOWN_THRESHOLD    (10)
-#define DEF_FREQUENCY_STEP              (1)
+#define DEF_FREQUENCY_DOWN_THRESHOLD    (20)
+#define DEF_FREQUENCY_STEP              (3)
 #define DEF_SAMPLING_DOWN_FACTOR        (4)
 #define MAX_SAMPLING_DOWN_FACTOR        (10)
 
