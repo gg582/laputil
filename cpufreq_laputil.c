@@ -6,15 +6,16 @@
  * Copyright (C) 2025 Lee Yunjin <gzblues61@daum.net>
  *
  * Conservative-style governor:
- *  - periodically sample CPU idle vs wall time per CPU in a policy
- *  - compute average load across policy CPUs
- *  - if load > up_threshold (effective) -> increase freq by freq_step (% of max)
- *  - if load < down_threshold (effective) -> after sampling_down_factor cycles, decrease freq
- *  - powersave_bias shifts effective thresholds to bias toward power or perf
+ * - periodically sample CPU idle vs wall time per CPU in a policy
+ * - compute average load across policy CPUs
+ * - if load > up_threshold (effective) -> increase freq by freq_step (% of max)
+ * - if load < down_threshold (effective) -> after sampling_down_factor cycles, decrease freq
+ * - powersave_bias shifts effective thresholds to bias toward power or perf
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/slab.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
@@ -31,8 +32,10 @@
 /*
  * Per-CPU previous state for idle accounting.
  */
+
 struct lap_cpu_dbs {
     u64 prev_cpu_idle;
+    u64 prev_cpu_nice;
     u64 prev_update_time;
 };
 
@@ -54,10 +57,9 @@ struct lap_policy_info {
     struct cpufreq_policy *policy;
 
     /* runtime state */
-    unsigned int down_skip;
     unsigned int requested_freq;
     unsigned int prev_load;
-    unsigned int idle_periods;
+    unsigned int idle_periods; // Now correctly used to count consecutive low-load cycles
 
     /* tuners embedded */
     struct lap_tuners tuners;
@@ -72,12 +74,14 @@ struct lap_policy_info {
 /* Conservative-like defaults */
 #define LAP_DEF_UP_THRESHOLD          75
 #define LAP_DEF_DOWN_THRESHOLD        15
-#define LAP_DEF_FREQ_STEP             3
+#define LAP_DEF_FREQ_STEP             5  
 #define LAP_DEF_SAMPLING_DOWN_FAC     2
 #define LAP_MAX_SAMPLING_DOWN_FAC     10
 #define LAP_DEF_SAMPLING_RATE         1   /* seconds */
 #define LAP_POWERSAVE_BIAS_MIN       -100
 #define LAP_POWERSAVE_BIAS_MAX        100
+#define LAP_MAX_FREQ_STEP_PERCENT     35
+#define LAP_MIN_FREQ_STEP_PERCENT     10
 
 /* Compute freq step in kHz from percent of policy->max */
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
@@ -87,8 +91,15 @@ static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
 
     step_khz = (tuners->freq_step * policy->max) / 100;
 
+    // Fallback logic for when the calculated step is 0
+    if (unlikely(step_khz == 0)) {
+        // Use a fixed minimal percentage to ensure some step, then calculate
+        step_khz = (LAP_MIN_FREQ_STEP_PERCENT * policy->max) / 100;
+    }
+
+    // Final check: if the minimal percentage still results in 0, use 1kHz as a last resort
     if (unlikely(step_khz == 0))
-        step_khz = LAP_DEF_FREQ_STEP; /* fallback small step (kHz) */
+        step_khz = 1;
 
     return step_khz;
 }
@@ -96,36 +107,47 @@ static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
 /*
  * lap_dbs_update - compute average load (0..100) across all CPUs in policy
  */
-static unsigned int lap_dbs_update(struct cpufreq_policy *policy)
+/*
+ * lap_dbs_update - compute average load (0..100) across all CPUs in policy
+ */
+static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_nice)
 {
     unsigned int load_sum = 0;
     unsigned int cpu;
     unsigned int cpus = cpumask_weight(policy->cpus);
+    u64 cur_time;
+    unsigned int time_elapsed;
+    unsigned int cur_load;
+
+    u64 cur_idle;
+    u64 cur_nice;
+    u64 idle_delta, nice_delta;
 
     if (!cpus)
         return 0;
 
     for_each_cpu(cpu, policy->cpus) {
         struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
-        u64 cur_idle = 0;
-        u64 cur_time = 0;
-        unsigned int time_elapsed = 0;
-        unsigned int idle_delta = 0;
-        unsigned int cur_load;
 
-        /* get cumulative idle and time (API variant used in many kernels) */
-        cur_idle = get_cpu_idle_time(cpu, &cur_time, 0);
+        cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
+        cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
 
         time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
         idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
+        nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice); 
 
-        if (unlikely(time_elapsed == 0 || idle_delta > time_elapsed)) {
+        if (unlikely(time_elapsed == 0)) {
             cur_load = 100;
         } else {
-            cur_load = 100 * (time_elapsed - idle_delta) / time_elapsed;
+            unsigned int busy_time = time_elapsed - idle_delta;
+            if (ignore_nice)
+                busy_time -= nice_delta; // ignore_nice == true -> exclude nice time
+
+            cur_load = 100 * busy_time / time_elapsed;
         }
 
         cdbs->prev_cpu_idle = cur_idle;
+        cdbs->prev_cpu_nice = cur_nice; // update prev_cpu_nice field
         cdbs->prev_update_time = cur_time;
 
         load_sum += cur_load;
@@ -133,6 +155,7 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy)
 
     return load_sum / cpus;
 }
+
 
 /*
  * cs_dbs_update - apply Laputil decision logic for one policy,
@@ -153,8 +176,11 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 
     tuners = &lp->tuners;
 
+    // Lock for safe access to tuners and state
+    mutex_lock(&lp->lock);
+
     /* compute current average load */
-    load = lap_dbs_update(policy);
+    load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
 
     requested_freq = lp->requested_freq;
 
@@ -167,7 +193,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     step_khz = lap_get_freq_step_khz(tuners, policy);
 
     /* derive effective thresholds using powersave_bias */
-    bias = tuners->powersave_bias; /* signed -100..100 */
+    bias = tuners->powersave_bias;
 
     eff_up = (int)tuners->up_threshold + bias;
     eff_down = (int)tuners->down_threshold + bias;
@@ -177,63 +203,46 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     if (eff_up < 1) eff_up = 1;
     if (eff_down < 0) eff_down = 0;
     if (eff_down >= eff_up) {
-        /* ensure down < up */
         eff_down = eff_up - 1;
         if (eff_down < 0)
             eff_down = 0;
     }
 
-    /* idle_periods placeholder handling for compatibility */
-    if (lp->idle_periods < UINT_MAX) {
-        unsigned int freq_steps = lp->idle_periods * step_khz;
-
-        if (requested_freq > policy->min + freq_steps)
-            requested_freq -= freq_steps;
-        else
-            requested_freq = policy->min;
-
-        lp->idle_periods = UINT_MAX;
-    }
-
     /* decision: up (use effective up threshold) */
     if (load > (unsigned int)eff_up) {
-        if (lp->prev_load > (unsigned int)eff_up) {
-            lp->down_skip = 0;
+        if (requested_freq != policy->max) {
+            requested_freq += step_khz;
+            if (requested_freq > policy->max)
+                requested_freq = policy->max;
 
-            if (requested_freq != policy->max) {
-                requested_freq += step_khz;
-                if (requested_freq > policy->max)
-                    requested_freq = policy->max;
-
-                cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
-                lp->requested_freq = requested_freq;
-            }
-        }
-
-        lp->prev_load = load;
-        return (unsigned long)tuners->sampling_rate * HZ;
-    }
-
-    /* sampling_down_factor: delay lowering until persisted */
-    if (++lp->down_skip < tuners->sampling_down_factor)
-        goto out_no_change;
-    lp->down_skip = 0;
-
-    /* decision: down (use effective down threshold) */
-    if (load < (unsigned int)eff_down) {
-        if (requested_freq != policy->min) {
-            if (requested_freq > step_khz)
-                requested_freq -= step_khz;
-            else
-                requested_freq = policy->min;
-
-            cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
+            cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
             lp->requested_freq = requested_freq;
         }
+        lp->idle_periods = 0; // Reset idle counter on upward change
+        lp->prev_load = load;
+    } else if (load < (unsigned int)eff_down) {
+        // Increment idle counter if load is low
+        lp->idle_periods++;
+        // Check if low load has persisted for long enough
+        if (lp->idle_periods >= tuners->sampling_down_factor) {
+            if (requested_freq != policy->min) {
+                if (requested_freq > step_khz)
+                    requested_freq -= step_khz;
+                else
+                    requested_freq = policy->min;
+
+                cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
+                lp->requested_freq = requested_freq;
+            }
+            lp->idle_periods = 0; // Reset idle counter after down-scaling
+        }
+    } else {
+        // Load is between thresholds, reset idle counter
+        lp->idle_periods = 0;
     }
 
-out_no_change:
     lp->prev_load = load;
+    mutex_unlock(&lp->lock);
     return (unsigned long)tuners->sampling_rate * HZ;
 }
 
@@ -260,16 +269,23 @@ static struct kobj_attribute _name##_attr = { \
     .store = store_##_name, \
 }
 
+/* All store functions must now acquire the mutex to prevent race conditions. */
+
 /* sampling_rate */
 static ssize_t show_sampling_rate(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.sampling_rate);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.sampling_rate);
+    mutex_unlock(&lp->lock);
+
+    return ret;
 }
 
 static ssize_t store_sampling_rate(struct kobject *kobj, struct kobj_attribute *attr,
@@ -287,10 +303,13 @@ static ssize_t store_sampling_rate(struct kobject *kobj, struct kobj_attribute *
     if (ret)
         return -EINVAL;
 
-    if (val == 0)
-        val = 1;
+    if (val == 0) // sampling rate must be non-zero
+        return -EINVAL;
 
+    mutex_lock(&lp->lock);
     lp->tuners.sampling_rate = val;
+    mutex_unlock(&lp->lock);
+    
     return count;
 }
 
@@ -299,11 +318,16 @@ static ssize_t show_sampling_down_factor(struct kobject *kobj, struct kobj_attri
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.sampling_down_factor);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.sampling_down_factor);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_sampling_down_factor(struct kobject *kobj, struct kobj_attribute *attr,
@@ -321,7 +345,10 @@ static ssize_t store_sampling_down_factor(struct kobject *kobj, struct kobj_attr
     if (ret || val < 1 || val > LAP_MAX_SAMPLING_DOWN_FAC)
         return -EINVAL;
 
+    mutex_lock(&lp->lock);
     lp->tuners.sampling_down_factor = val;
+    mutex_unlock(&lp->lock);
+    
     return count;
 }
 
@@ -330,11 +357,16 @@ static ssize_t show_up_threshold(struct kobject *kobj, struct kobj_attribute *at
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.up_threshold);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.up_threshold);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_up_threshold(struct kobject *kobj, struct kobj_attribute *attr,
@@ -349,10 +381,17 @@ static ssize_t store_up_threshold(struct kobject *kobj, struct kobj_attribute *a
         return -EINVAL;
 
     ret = kstrtouint(buf, 10, &val);
-    if (ret || val > 100 || val <= lp->tuners.down_threshold)
+    if (ret || val > 100)
         return -EINVAL;
 
+    mutex_lock(&lp->lock);
+    if (val <= lp->tuners.down_threshold) {
+        mutex_unlock(&lp->lock);
+        return -EINVAL;
+    }
     lp->tuners.up_threshold = val;
+    mutex_unlock(&lp->lock);
+    
     return count;
 }
 
@@ -361,11 +400,16 @@ static ssize_t show_down_threshold(struct kobject *kobj, struct kobj_attribute *
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.down_threshold);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.down_threshold);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_down_threshold(struct kobject *kobj, struct kobj_attribute *attr,
@@ -380,23 +424,35 @@ static ssize_t store_down_threshold(struct kobject *kobj, struct kobj_attribute 
         return -EINVAL;
 
     ret = kstrtouint(buf, 10, &val);
-    if (ret || val < 0 || val >= lp->tuners.up_threshold)
+    if (ret || val < 0)
         return -EINVAL;
 
+    mutex_lock(&lp->lock);
+    if (val >= lp->tuners.up_threshold) {
+        mutex_unlock(&lp->lock);
+        return -EINVAL;
+    }
     lp->tuners.down_threshold = val;
+    mutex_unlock(&lp->lock);
+
     return count;
 }
 
-/* ignore_nice_load (kept but not used) */
+/* ignore_nice_load  */
 static ssize_t show_ignore_nice_load(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.ignore_nice_load);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.ignore_nice_load);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_ignore_nice_load(struct kobject *kobj, struct kobj_attribute *attr,
@@ -414,7 +470,10 @@ static ssize_t store_ignore_nice_load(struct kobject *kobj, struct kobj_attribut
     if (ret)
         return -EINVAL;
 
+    mutex_lock(&lp->lock);
     lp->tuners.ignore_nice_load = !!val;
+    mutex_unlock(&lp->lock);
+
     return count;
 }
 
@@ -423,11 +482,16 @@ static ssize_t show_freq_step(struct kobject *kobj, struct kobj_attribute *attr,
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%u\n", lp->tuners.freq_step);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%u\n", lp->tuners.freq_step);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_freq_step(struct kobject *kobj, struct kobj_attribute *attr,
@@ -442,10 +506,13 @@ static ssize_t store_freq_step(struct kobject *kobj, struct kobj_attribute *attr
         return -EINVAL;
 
     ret = kstrtouint(buf, 10, &val);
-    if (ret || val > 100)
+    if (ret || val > LAP_MAX_FREQ_STEP_PERCENT || val < LAP_MIN_FREQ_STEP_PERCENT)
         return -EINVAL;
 
+    mutex_lock(&lp->lock);
     lp->tuners.freq_step = val;
+    mutex_unlock(&lp->lock);
+    
     return count;
 }
 
@@ -454,11 +521,16 @@ static ssize_t show_powersave_bias(struct kobject *kobj, struct kobj_attribute *
 {
     struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
     struct lap_policy_info *lp = policy->governor_data;
+    ssize_t ret;
 
     if (!lp)
         return sprintf(buf, "0\n");
 
-    return sprintf(buf, "%d\n", lp->tuners.powersave_bias);
+    mutex_lock(&lp->lock);
+    ret = sprintf(buf, "%d\n", lp->tuners.powersave_bias);
+    mutex_unlock(&lp->lock);
+    
+    return ret;
 }
 
 static ssize_t store_powersave_bias(struct kobject *kobj, struct kobj_attribute *attr,
@@ -481,7 +553,10 @@ static ssize_t store_powersave_bias(struct kobject *kobj, struct kobj_attribute 
     if (val > LAP_POWERSAVE_BIAS_MAX)
         val = LAP_POWERSAVE_BIAS_MAX;
 
+    mutex_lock(&lp->lock);
     lp->tuners.powersave_bias = val;
+    mutex_unlock(&lp->lock);
+    
     return count;
 }
 
@@ -521,14 +596,13 @@ static int lap_start(struct cpufreq_policy *policy)
         return -EINVAL;
 
     mutex_lock(&lp->lock);
-    lp->down_skip = 0;
     lp->requested_freq = policy->cur;
     lp->prev_load = 0;
-    lp->idle_periods = 0;
-
+    lp->idle_periods = 0; // Correctly initialize the counter
+    mutex_unlock(&lp->lock);
+    
     delay = (unsigned long)lp->tuners.sampling_rate * HZ;
     schedule_delayed_work_on(policy->cpu, &lp->work, delay);
-    mutex_unlock(&lp->lock);
 
     return 0;
 }
@@ -617,4 +691,3 @@ MODULE_LICENSE("GPL");
 
 module_init(laputil_module_init);
 module_exit(laputil_module_exit);
-
