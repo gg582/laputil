@@ -35,7 +35,9 @@ su
 
 #### Update
 ```bash
-sudo ./update.sh
+su
+./scripts/generate_ac_headers.sh
+./update.sh
 ```
 
 #### For Intel Chips(Required)

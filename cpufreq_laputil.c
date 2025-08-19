@@ -175,7 +175,7 @@ static inline _Bool lap_is_on_ac(void)
     for (i = 0; i < ARRAY_SIZE(ac_names); i++) {
         psy = power_supply_get_by_name(ac_names[i]);
         if (!psy)
-            return 0;
+            return 1;
 
         if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
             if (val.intval)
