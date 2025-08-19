@@ -29,8 +29,8 @@
 #include <linux/mutex.h>
 #include <linux/sched/cpufreq.h>
 #include <linux/errno.h>
-extern struct class *power_supply_class;
-
+#include <linux/string.h>
+#include "include/ac_names_gen.h"
 /*
  * Per-CPU previous state for idle accounting.
  */
@@ -163,32 +163,28 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
     return load_sum / cpus;
 }
 
-static inline _Bool lap_is_on_ac(void) {
-    struct class_dev_iter iter;
-    struct device *dev;
+/*
+ * lap_is_on_ac - Return 1 if system is on AC power, 0 otherwise.
+ */
+static inline _Bool lap_is_on_ac(void)
+{
+    struct power_supply *psy;
+    union power_supply_propval val;
+    int i;
 
-    // init power supply iterator
-    class_dev_iter_init(&iter, power_supply_class, NULL, NULL);
+    for (i = 0; i < ARRAY_SIZE(ac_names); i++) {
+        psy = power_supply_get_by_name(ac_names[i]);
+        if (!psy)
+            continue;
 
-    while((dev = class_dev_iter_next(&iter))) {
-        struct power_supply *psy = dev_get_drvdata(dev);
-        union power_supply_propval info;
-        int ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TYPE, &info);
-        if(ret < 0) {
-            return 1;
-        }
-        if(info.intval == POWER_SUPPLY_TYPE_BATTERY) {
-            ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &info);
-            if(info.intval == POWER_SUPPLY_STATUS_DISCHARGING) {
-                return 0;
-            }
+        if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
+            if (val.intval)
+                return 1;
         }
     }
-    class_dev_iter_exit(&iter);
-    return 1;
 
+    return 0;
 }
-
 
 /*
  * cs_dbs_update - apply Laputil decision logic for one policy,
@@ -733,3 +729,4 @@ MODULE_LICENSE("GPL");
 
 module_init(laputil_module_init);
 module_exit(laputil_module_exit);
+

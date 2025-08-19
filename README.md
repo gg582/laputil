@@ -28,7 +28,9 @@ This allows the governor to *seamlessly transition* between performance-focused 
 #### Installation
 
 ```bash
-sudo ./install.sh
+su
+./scripts/generate_ac_headers.sh
+./install.sh
 ```
 
 #### Update
