@@ -16,6 +16,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kernel_stat.h>
+#include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
@@ -28,6 +29,7 @@
 #include <linux/mutex.h>
 #include <linux/sched/cpufreq.h>
 #include <linux/errno.h>
+extern struct class *power_supply_class;
 
 /*
  * Per-CPU previous state for idle accounting.
@@ -60,6 +62,7 @@ struct lap_policy_info {
     unsigned int requested_freq;
     unsigned int prev_load;
     unsigned int idle_periods; // Now correctly used to count consecutive low-load cycles
+    unsigned int smoothed_load;
 
     /* tuners embedded */
     struct lap_tuners tuners;
@@ -80,8 +83,12 @@ struct lap_policy_info {
 #define LAP_DEF_SAMPLING_RATE         1   /* seconds */
 #define LAP_POWERSAVE_BIAS_MIN       -100
 #define LAP_POWERSAVE_BIAS_MAX        100
+/* powersave bias tweak on lap_is_on_ac() */
+#define LAP_DEF_POWERSAVE_BIAS_DEFAULT             2
 #define LAP_MAX_FREQ_STEP_PERCENT     35
 #define LAP_MIN_FREQ_STEP_PERCENT     10
+/* Should be within 1-200. 1-4 will be safe */
+#define LAP_DEF_EMA_ALPHA_SCALING_FACTOR 3 
 
 /* Compute freq step in kHz from percent of policy->max */
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
@@ -156,6 +163,32 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
     return load_sum / cpus;
 }
 
+static inline _Bool lap_is_on_ac(void) {
+    struct class_dev_iter iter;
+    struct device *dev;
+
+    // init power supply iterator
+    class_dev_iter_init(&iter, power_supply_class, NULL, NULL);
+
+    while((dev = class_dev_iter_next(&iter))) {
+        struct power_supply *psy = dev_get_drvdata(dev);
+        union power_supply_propval info;
+        int ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TYPE, &info);
+        if(ret < 0) {
+            return 1;
+        }
+        if(info.intval == POWER_SUPPLY_TYPE_BATTERY) {
+            ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &info);
+            if(info.intval == POWER_SUPPLY_STATUS_DISCHARGING) {
+                return 0;
+            }
+        }
+    }
+    class_dev_iter_exit(&iter);
+    return 1;
+
+}
+
 
 /*
  * cs_dbs_update - apply Laputil decision logic for one policy,
@@ -181,6 +214,9 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 
     /* compute current average load */
     load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
+    int load_delta = load - lp->prev_load;
+    u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
+    lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
 
     requested_freq = lp->requested_freq;
 
@@ -192,8 +228,14 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 
     step_khz = lap_get_freq_step_khz(tuners, policy);
 
+
     /* derive effective thresholds using powersave_bias */
     bias = tuners->powersave_bias;
+    if(lap_is_on_ac()) {
+        bias += LAP_DEF_POWERSAVE_BIAS_DEFAULT;
+    } else {
+        bias -= LAP_DEF_POWERSAVE_BIAS_DEFAULT;
+    }
 
     eff_up = (int)tuners->up_threshold + bias;
     eff_down = (int)tuners->down_threshold + bias;
@@ -209,7 +251,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     }
 
     /* decision: up (use effective up threshold) */
-    if (load > (unsigned int)eff_up) {
+    if (lp->smoothed_load > (unsigned int)eff_up) {
         if (requested_freq != policy->max) {
             requested_freq += step_khz;
             if (requested_freq > policy->max)
@@ -219,7 +261,6 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
             lp->requested_freq = requested_freq;
         }
         lp->idle_periods = 0; // Reset idle counter on upward change
-        lp->prev_load = load;
     } else if (load < (unsigned int)eff_down) {
         // Increment idle counter if load is low
         lp->idle_periods++;
@@ -242,6 +283,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     }
 
     lp->prev_load = load;
+    lp->requested_freq = requested_freq;
     mutex_unlock(&lp->lock);
     return (unsigned long)tuners->sampling_rate * HZ;
 }
