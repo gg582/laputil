@@ -84,7 +84,7 @@ struct lap_policy_info {
 #define LAP_POWERSAVE_BIAS_MIN       -100
 #define LAP_POWERSAVE_BIAS_MAX        100
 /* powersave bias tweak on lap_is_on_ac() */
-#define LAP_DEF_POWERSAVE_BIAS_DEFAULT             2
+#define LAP_DEF_POWERSAVE_BIAS_DEFAULT             1
 #define LAP_MAX_FREQ_STEP_PERCENT     35
 #define LAP_MIN_FREQ_STEP_PERCENT     10
 /* Should be within 1-200. 1-4 will be safe */
@@ -172,14 +172,30 @@ static inline _Bool lap_is_on_ac(void)
     union power_supply_propval val;
     int i;
 
-    for (i = 0; i < ARRAY_SIZE(ac_names); i++) {
-        psy = power_supply_get_by_name(ac_names[i]);
-        if (!psy)
-            return 1;
-
-        if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-            if (val.intval)
+    if(ARRAY_SIZE(ac_names) > 0) {
+        for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
+            psy = power_supply_get_by_name(ac_names[i]);
+            if (psy == NULL)
                 return 1;
+
+            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
+                if (val.intval)
+                    return 1;
+            }
+        }
+    }
+
+    if(ARRAY_SIZE(battery_names) > 0) {
+        for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
+            psy = power_supply_get_by_name(battery_names[i]);
+            if (psy == NULL)
+                return 1;
+
+            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
+                if (val.intval)
+                    return 0;
+            }
+
         }
     }
 
@@ -212,6 +228,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
     int load_delta = load - lp->prev_load;
     u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
+    ema_alpha = ema_alpha < 30 ? 30: ema_alpha;
     lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
 
     requested_freq = lp->requested_freq;
