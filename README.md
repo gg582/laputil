@@ -42,6 +42,10 @@ su
 
 #### For Intel Chips(Required)
 Add `intel_pstate=passive` to `GRUB_CMDLINE_LINUX_DEFAULT`.
+#### For Intel Meteor Lake Chips(Required)
+```bash
+patch -p1 < lp-e.patch
+```
 
 #### Example
 `GRUB_CMDLINE_LINUX_DEFAULT="quiet splash intel_pstate=passive"`

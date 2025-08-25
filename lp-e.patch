@@ -1,0 +1,177 @@
+--- cpufreq_laputil.c.orig	2025-08-25 18:08:44.157067728 +0900
++++ cpufreq_laputil.c	2025-08-25 18:12:18.085391091 +0900
+@@ -61,6 +61,7 @@
+     struct mutex lock;
+     struct cpumask eff_mask;  /* Efficiency cores mask */
+     struct cpumask perf_mask; /* Performance cores mask */
++    struct cpumask lp_eff_mask;
+ };
+ 
+ #define LAP_DEF_UP_THRESHOLD          75
+@@ -77,28 +78,40 @@
+ #define LAP_DEF_EMA_ALPHA_SCALING_FACTOR 3
+ 
+ /* Detect efficiency and performance cores based on max frequency */
+-static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask *perf_mask)
++static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask * lp_eff_mask, struct cpumask *perf_mask)
+ {
+     unsigned int cpu;
+-    unsigned int eff_max_freq = UINT_MAX, perf_max_freq = 0;
++    unsigned int max_freq, min_freq = UINT_MAX, highest_freq = 0;
++
++    cpumask_clear(perf_mask);
++    cpumask_clear(e_mask);
++    cpumask_clear(lp_e_mask);
+ 
+     cpumask_clear(eff_mask);
+     cpumask_clear(perf_mask);
+ 
++     /* Find min and max CPU frequencies */
+     for_each_cpu(cpu, policy->cpus) {
+-        unsigned int max_freq = cpufreq_quick_get_max(cpu);
+-        if (max_freq < eff_max_freq) {
+-            eff_max_freq = max_freq;
+-            cpumask_set_cpu(cpu, eff_mask);
+-        }
+-        if (max_freq > perf_max_freq) {
+-            perf_max_freq = max_freq;
++        max_freq = cpufreq_quick_get_max(cpu);
++        if (max_freq < min_freq) min_freq = max_freq;
++        if (max_freq > highest_freq) highest_freq = max_freq;
++    }
++
++    /* Assign cores based on frequency tiers */
++    for_each_cpu(cpu, policy->cpus) {
++        max_freq = cpufreq_quick_get_max(cpu);
++        if (max_freq == highest_freq)
+             cpumask_set_cpu(cpu, perf_mask);
+-        }
++        else if (max_freq == min_freq)
++            cpumask_set_cpu(cpu, lp_e_mask);
++        else
++            cpumask_set_cpu(cpu, e_mask);
+     }
+ 
+-    pr_info("Detected %u efficiency cores (max_freq: %u kHz), %u performance cores (max_freq: %u kHz)\n",
+-            cpumask_weight(eff_mask), eff_max_freq, cpumask_weight(perf_mask), perf_max_freq);
++     pr_info("Detected clusters: %u Perf, %u E, %u LP-E\n",
++            cpumask_weight(perf_mask),
++            cpumask_weight(e_mask),
++            cpumask_weight(lp_e_mask));
+ }
+ 
+ /* Compute freq step in kHz from percent of policy->max */
+@@ -158,47 +171,41 @@
+     return 0;
+ }
+ 
+-/* lap_dbs_update - compute average load (0..100) across all CPUs in policy */
++/* lap_dbs_update - compute average load with 3 cluster weights */
+ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_nice)
+ {
+     struct lap_policy_info *lp = policy->governor_data;
+-    unsigned int load_sum = 0, eff_load_sum = 0, perf_load_sum = 0;
++    unsigned int load_sum = 0, perf_load_sum = 0, e_load_sum = 0, lp_e_load_sum = 0;
+     unsigned int cpu;
+-    unsigned int eff_cpus = 0, perf_cpus = 0;
+-    u64 cur_time;
+-    unsigned int time_elapsed;
+-    unsigned int cur_load;
+-    u64 cur_idle, cur_nice;
+-    u64 idle_delta, nice_delta;
++    unsigned int perf_cpus = 0, e_cpus = 0, lp_e_cpus = 0;
++    u64 cur_time, cur_idle, cur_nice, idle_delta, nice_delta;
++    unsigned int time_elapsed, cur_load;
+     int battery_capacity;
+ 
+     if (!lp || !cpumask_weight(policy->cpus))
+         return 0;
+ 
+-    /* Initialize core masks if not already done */
+-    if (cpumask_empty(&lp->eff_mask) || cpumask_empty(&lp->perf_mask)) {
+-        detect_clusters(policy, &lp->eff_mask, &lp->perf_mask);
+-        eff_cpus = cpumask_weight(&lp->eff_mask);
+-        perf_cpus = cpumask_weight(&lp->perf_mask);
+-    } else {
+-        eff_cpus = cpumask_weight(&lp->eff_mask);
+-        perf_cpus = cpumask_weight(&lp->perf_mask);
++    /* Detect clusters if not initialized */
++    if (cpumask_empty(&lp->perf_mask) || cpumask_empty(&lp->e_mask) || cpumask_empty(&lp->lp_e_mask)) {
++        detect_clusters(policy, &lp->perf_mask, &lp->e_mask, &lp->lp_e_mask);
+     }
+ 
+-    /* Compute load for efficiency and performance cores separately */
++    perf_cpus = cpumask_weight(&lp->perf_mask);
++    e_cpus = cpumask_weight(&lp->e_mask);
++    lp_e_cpus = cpumask_weight(&lp->lp_e_mask);
++
++    /* Compute load per CPU */
+     for_each_cpu(cpu, policy->cpus) {
+         struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
+-
+         cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
+         cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
+-
+         time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
+         idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
+         nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice);
+ 
+-        if (unlikely(time_elapsed == 0)) {
++        if (unlikely(time_elapsed == 0))
+             cur_load = 100;
+-        } else {
++        else {
+             unsigned int busy_time = time_elapsed - idle_delta;
+             if (ignore_nice)
+                 busy_time -= nice_delta;
+@@ -209,29 +216,33 @@
+         cdbs->prev_cpu_nice = cur_nice;
+         cdbs->prev_update_time = cur_time;
+ 
+-        if (cpumask_test_cpu(cpu, &lp->eff_mask)) {
+-            eff_load_sum += cur_load;
+-        } else if (cpumask_test_cpu(cpu, &lp->perf_mask)) {
++        if (cpumask_test_cpu(cpu, &lp->perf_mask))
+             perf_load_sum += cur_load;
+-        }
++        else if (cpumask_test_cpu(cpu, &lp->e_mask))
++            e_load_sum += cur_load;
++        else if (cpumask_test_cpu(cpu, &lp->lp_e_mask))
++            lp_e_load_sum += cur_load;
++
+         load_sum += cur_load;
+     }
+ 
+-    /* Calculate average load based on battery capacity */
+-    if (eff_cpus && perf_cpus) {
+-        unsigned int eff_load = eff_load_sum / eff_cpus;
+-        unsigned int perf_load = perf_load_sum / perf_cpus;
+-
+-        if (!lap_is_on_ac(&battery_capacity) && battery_capacity <= 20) {
+-            /* Prioritize efficiency cores at low battery */
+-            return eff_load;
+-        } else {
+-            /* Weighted average: 60% efficiency, 40% performance */
+-            return (eff_load * 6 + perf_load * 4) / 10;
+-        }
++    /* Weighted load based on power source and battery */
++    unsigned int final_load = 0;
++    if (perf_cpus || e_cpus || lp_e_cpus) {
++        unsigned int perf_load = perf_cpus ? perf_load_sum / perf_cpus : 0;
++        unsigned int e_load = e_cpus ? e_load_sum / e_cpus : 0;
++        unsigned int lp_e_load = lp_e_cpus ? lp_e_load_sum / lp_e_cpus : 0;
++
++        if (!lap_is_on_ac(&battery_capacity) && battery_capacity <= 20)
++            final_load = (lp_e_load * 7 + e_load * 2 + perf_load * 1) / 10;
++        else if (!lap_is_on_ac(&battery_capacity))
++            final_load = (lp_e_load * 5 + e_load * 3 + perf_load * 2) / 10;
++        else
++            final_load = (perf_load * 5 + e_load * 3 + lp_e_load * 2) / 10;
++
++        return final_load;
+     }
+ 
+-    /* Fallback to average load across all CPUs */
+     return load_sum / cpumask_weight(policy->cpus);
+ }
+ 
