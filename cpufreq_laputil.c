@@ -349,10 +349,10 @@ static ssize_t show_sampling_rate(struct kobject *kobj, struct kobj_attribute *a
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 2, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.sampling_rate);
+    ret = snprintf(buf, 12, "%u\n", lp->tuners.sampling_rate);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -386,10 +386,10 @@ static ssize_t show_sampling_down_factor(struct kobject *kobj, struct kobj_attri
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 2, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.sampling_down_factor);
+    ret = snprintf(buf, 12, "%u\n", lp->tuners.sampling_down_factor);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -423,10 +423,10 @@ static ssize_t show_up_threshold(struct kobject *kobj, struct kobj_attribute *at
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 2, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.up_threshold);
+    ret = snprintf(buf, 12, "%u\n", lp->tuners.up_threshold);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -464,10 +464,10 @@ static ssize_t show_down_threshold(struct kobject *kobj, struct kobj_attribute *
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 2, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.down_threshold);
+    ret = snprintf(buf, 12, "%u\n", lp->tuners.down_threshold);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -505,10 +505,10 @@ static ssize_t show_ignore_nice_load(struct kobject *kobj, struct kobj_attribute
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 3, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.ignore_nice_load);
+    ret = snprintf(buf, 3, "%u\n", lp->tuners.ignore_nice_load);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -542,10 +542,10 @@ static ssize_t show_freq_step(struct kobject *kobj, struct kobj_attribute *attr,
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 3, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%u\n", lp->tuners.freq_step);
+    ret = snprintf(buf, 12, "%u\n", lp->tuners.freq_step);
     mutex_unlock(&lp->lock);
     return ret;
 }
@@ -579,10 +579,10 @@ static ssize_t show_powersave_bias(struct kobject *kobj, struct kobj_attribute *
     ssize_t ret;
 
     if (!lp)
-        return sprintf(buf, "0\n");
+        return snprintf(buf, 3, "0\n");
 
     mutex_lock(&lp->lock);
-    ret = sprintf(buf, "%d\n", lp->tuners.powersave_bias);
+    ret = snprintf(buf, 5,"%d\n", lp->tuners.powersave_bias);
     mutex_unlock(&lp->lock);
     return ret;
 }
