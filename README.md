@@ -1,6 +1,8 @@
 ## LapUtil: Custom Linux Governor for Laptops
 
 [![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=code+coverage&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)
+[![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=active+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)
+[![DeepSource](https://app.deepsource.com/gh/gg582/laputil.svg/?label=resolved+issues&show_trend=true&token=TI2tAytzI2P2dcKbncHMTzfG)](https://app.deepsource.com/gh/gg582/laputil/)
 
 **LapUtil** is a custom CPU frequency governor designed for laptops to extend battery life. It's based on the proven `conservative` governor but optimized with a more aggressive, real-time approach to frequency scaling.
 
