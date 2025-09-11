@@ -88,6 +88,11 @@ struct lap_policy_info {
 #define LAP_DEF_EMA_ALPHA_SCALING_FACTOR  3
 
 /* update_power_momentum_fixed - update momentum values from power draw */
+/*
+ * We use two momentum-like variables, inspired by the Adam optimizer.
+ * 'm' tracks the momentum (the direction of the update).
+ * 'v' tracks the variance (to adaptively scale the update size).
+ */
 static void update_power_momentum_fixed(s64 current_power)
 {
     s64 power_fp = current_power << FP_SHIFT;
@@ -181,7 +186,6 @@ static inline void lap_is_on_ac(battery_t *battery_status)
         if (power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val) == 0) {
             battery_status->remaining = val.intval;
 
-            /* **BUG FIX**: Correctly get and store power_avg */
             if (power_supply_get_property(psy, POWER_SUPPLY_PROP_POWER_AVG, &val) == 0) {
                 /* Store the value in the provided battery_status struct */
                 battery_status->power_avg = val.intval / 1000; /* uW to mW */
@@ -300,7 +304,7 @@ static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m,
     struct lap_policy_info *lp = policy->governor_data;
     s32 trend_mw = m >> FP_SHIFT;
     s64 volatility_mw2 = v >> FP_SHIFT;
-    s64 update_vector;
+    s64 update_vector = 0;
     s32 freq_step = 0;
     unsigned int requested_freq, step_khz;
 
@@ -308,11 +312,7 @@ static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m,
         u64 sqrt_v = isqrt((u64)volatility_mw2);
         if (sqrt_v > 0) {
             update_vector = div64_s64((s64)trend_mw << 8, sqrt_v);
-        } else {
-            update_vector = 0;
         }
-    } else {
-        update_vector = 0;
     }
 
     /* **TUNING**: Adjust step sizes for better responsiveness */
@@ -324,6 +324,8 @@ static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m,
         freq_step = -4; /* More aggressive step-down for clear idle trend */
     } else if (update_vector < -AFS_LOW_THRESHOLD) {
         freq_step = -2; /* Stronger step-down for moderate idle trend */
+    } else {
+        freq_step = 0; // do nothing when update_vector is weak enough
     }
 
     /* **TUNING**: Strengthen the override condition */
