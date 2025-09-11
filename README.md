@@ -20,7 +20,7 @@ LapUtil adapts the ideas of the *Adam* optimizer from machine learning to manage
 By combining these factors in an `m / sqrt(v)`-like manner, LapUtil responds only to **sustained changes** in power usage, avoiding jitter from short spikes while anticipating future demand.  
 
 ### 2. Dynamic Load Smoothing (EMA)
-Minor load fluctuations shouldn�셳 cause frequent frequency jumps. LapUtil applies an **Exponential Moving Average (EMA)** to CPU load, but with a twist:  
+Minor load fluctuations shouldn't cause frequent frequency jumps. LapUtil applies an **Exponential Moving Average (EMA)** to CPU load, but with a twist:  
 
 - **High load volatility:** The smoothing factor (alpha) increases, making the governor more responsive.  
 - **Stable load:** Alpha decreases, keeping frequencies steady and efficient.  
