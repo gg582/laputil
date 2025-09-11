@@ -14,7 +14,7 @@ Instead of reacting only to raw CPU utilization, LapUtil employs a **predictive,
 ### 1. Adam-Inspired Predictive Optimizer
 LapUtil adapts the ideas of the *Adam* optimizer from machine learning to manage CPU frequency using **power consumption trends**, not just CPU load.  
 
-- **m (Momentum):** Tracks the *average directional trend* of power consumption �� rising, stable, or falling.  
+- **m (Momentum):** Tracks the *average directional trend* of power consumption: rising, stable, or falling.  
 - **v (Volatility):** Measures how *unstable or spiky* the power usage is.  
 
 By combining these factors in an `m / sqrt(v)`-like manner, LapUtil responds only to **sustained changes** in power usage, avoiding jitter from short spikes while anticipating future demand.  
