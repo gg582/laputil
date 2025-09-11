@@ -1,16 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * drivers/cpufreq/cpufreq_laputil.c
- * laputil: laptop-oriented conservative governor (with powersave_bias)
+ * laputil: laptop-oriented conservative governor
  *
  * Copyright (C) 2025 Lee Yunjin <gzblues61@daum.net>
  *
  * Conservative-style governor:
  * - periodically sample CPU idle vs wall time per CPU in a policy
  * - compute average load across policy CPUs
- * - if load > up_threshold (effective) -> increase freq by freq_step (% of max)
- * - if load < down_threshold (effective) -> after sampling_down_factor cycles, decrease freq
- * - powersave_bias shifts effective thresholds to bias toward power or perf
+ * - optimize cpu frequency steps via adam inspired optimizer
  */
 
 #include <linux/module.h>
@@ -30,7 +27,24 @@
 #include <linux/sched/cpufreq.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/types.h>
 #include "include/ac_names_gen.h"
+#include "include/battery.h"
+
+#define FP_SHIFT 16
+#define FP_SCALE (1 << FP_SHIFT)
+
+#define BETA1_FP ((s64)(58982))
+#define BETA2_FP ((s64)(65470))
+
+#define ONE_MINUS_BETA1_FP (FP_SCALE - BETA1_FP)
+#define ONE_MINUS_BETA2_FP (FP_SCALE - BETA2_FP)
+
+#define AFS_HIGH_THRESHOLD 150
+#define AFS_LOW_THRESHOLD  50
+
+static s64 m_fp = 0;
+static s64 v_fp = 0;
 
 struct lap_cpu_dbs {
     u64 prev_cpu_idle;
@@ -41,42 +55,51 @@ struct lap_cpu_dbs {
 DEFINE_PER_CPU(struct lap_cpu_dbs, lap_cpu_dbs);
 
 struct lap_tuners {
-    unsigned int down_threshold;       /* percent (0..100) */
-    unsigned int freq_step;            /* percent (of policy->max) */
-    unsigned int up_threshold;         /* percent (0..100) */
-    unsigned int sampling_down_factor; /* how many sampling intervals to wait before down */
-    unsigned int ignore_nice_load;     /* boolean (preserved but unused here) */
-    unsigned int sampling_rate;        /* seconds between samples */
-    int powersave_bias;                /* signed bias (-100 .. 100) */
+    unsigned int down_threshold;
+    unsigned int freq_step;
+    unsigned int up_threshold;
+    unsigned int sampling_down_factor;
+    unsigned int ignore_nice_load;
+    unsigned int sampling_rate;
 };
 
 struct lap_policy_info {
     struct cpufreq_policy *policy;
     unsigned int requested_freq;
     unsigned int prev_load;
+    unsigned int prev_remaining;
     unsigned int idle_periods;
     unsigned int smoothed_load;
     struct lap_tuners tuners;
     struct delayed_work work;
     struct mutex lock;
-    struct cpumask eff_mask;  /* Efficiency cores mask */
-    struct cpumask perf_mask; /* Performance cores mask */
+    struct cpumask eff_mask;
+    struct cpumask perf_mask;
 };
 
-#define LAP_DEF_UP_THRESHOLD          75
-#define LAP_DEF_DOWN_THRESHOLD        10
-#define LAP_DEF_FREQ_STEP             5
-#define LAP_DEF_SAMPLING_DOWN_FAC     2
-#define LAP_MAX_SAMPLING_DOWN_FAC     5
-#define LAP_DEF_SAMPLING_RATE         1
-#define LAP_POWERSAVE_BIAS_MIN        0
-#define LAP_POWERSAVE_BIAS_MAX        10
-#define LAP_DEF_POWERSAVE_BIAS_DEFAULT 1
-#define LAP_MAX_FREQ_STEP_PERCENT     25
-#define LAP_MIN_FREQ_STEP_PERCENT     5
-#define LAP_DEF_EMA_ALPHA_SCALING_FACTOR 3
+#define LAP_DEF_UP_THRESHOLD             75
+#define LAP_DEF_DOWN_THRESHOLD           10
+#define LAP_DEF_FREQ_STEP                 5
+#define LAP_DEF_SAMPLING_DOWN_FAC         2
+#define LAP_MAX_SAMPLING_DOWN_FAC         5
+#define LAP_DEF_SAMPLING_RATE             1
+#define LAP_MAX_FREQ_STEP_PERCENT        25
+#define LAP_MIN_FREQ_STEP_PERCENT         5
+#define LAP_DEF_EMA_ALPHA_SCALING_FACTOR  3
 
-/* Detect efficiency and performance cores based on max frequency */
+/* update_power_momentum_fixed - update momentum values from power draw */
+static void update_power_momentum_fixed(s64 current_power)
+{
+    s64 power_fp = current_power << FP_SHIFT;
+    s64 power_sq_fp = (current_power * current_power) << FP_SHIFT;
+
+    m_fp = (((BETA1_FP * m_fp) >> FP_SHIFT) +
+            ((ONE_MINUS_BETA1_FP * power_fp) >> FP_SHIFT));
+    v_fp = (((BETA2_FP * v_fp) >> FP_SHIFT) +
+            ((ONE_MINUS_BETA2_FP * power_sq_fp) >> FP_SHIFT));
+}
+
+/* detect_clusters - Detect efficiency and performance cores */
 static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask *perf_mask)
 {
     unsigned int cpu;
@@ -96,14 +119,11 @@ static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_m
             cpumask_set_cpu(cpu, perf_mask);
         }
     }
-
-    pr_info("Detected %u efficiency cores (max_freq: %u kHz), %u performance cores (max_freq: %u kHz)\n",
-            cpumask_weight(eff_mask), eff_max_freq, cpumask_weight(perf_mask), perf_max_freq);
 }
 
-/* Compute freq step in kHz from percent of policy->max */
+/* lap_get_freq_step_khz - Compute freq step in kHz from percent */
 static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
-                                                struct cpufreq_policy *policy)
+                                                 struct cpufreq_policy *policy)
 {
     unsigned int step_khz;
 
@@ -119,45 +139,60 @@ static inline unsigned int lap_get_freq_step_khz(struct lap_tuners *tuners,
     return step_khz;
 }
 
-/* lap_is_on_ac - Return 1 if system is on AC power, 0 otherwise. */
-static inline _Bool lap_is_on_ac(int *battery_capacity)
+/* lap_is_on_ac - Retrieves Battery/AC Status and Average Power */
+static inline void lap_is_on_ac(battery_t *battery_status)
 {
     struct power_supply *psy;
     union power_supply_propval val;
     int i;
+    bool found_ac = false;
 
-    *battery_capacity = 100; // Default to full capacity if unknown
+    /* Default to on-battery, 100% capacity, 0 power draw */
+    battery_status->active = 1;
+    battery_status->remaining = 100;
+    battery_status->power_avg = 0;
 
-    if (ARRAY_SIZE(ac_names) > 0) {
-        for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
-            psy = power_supply_get_by_name(ac_names[i]);
-            if (psy == NULL)
-                continue;
-            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-                if (val.intval)
-                    return 1;
-            }
+    /* First, check all possible AC adapter names */
+    for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
+        psy = power_supply_get_by_name(ac_names[i]);
+        if (!psy)
+            continue;
+
+        if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) == 0 && val.intval) {
+            found_ac = true;
+            power_supply_put(psy);
+            break; /* If any AC adapter is online, we are on AC power */
         }
+        power_supply_put(psy);
     }
 
-    if (ARRAY_SIZE(battery_names) > 0) {
-        for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
-            psy = power_supply_get_by_name(battery_names[i]);
-            if (psy == NULL)
-                continue;
-            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-                if (val.intval) {
-                    if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val))
-                        *battery_capacity = val.intval;
-                    return 0;
-                }
-            }
-        }
+    if (found_ac) {
+        battery_status->active = 0; /* On AC power */
+        return;
     }
 
-    return 0;
+    /* If not on AC, find the first available battery to get its status */
+    for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
+        psy = power_supply_get_by_name(battery_names[i]);
+        if (!psy)
+            continue;
+
+        /* Try to get capacity and average power from this battery */
+        if (power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val) == 0) {
+            battery_status->remaining = val.intval;
+
+            /* **BUG FIX**: Correctly get and store power_avg */
+            if (power_supply_get_property(psy, POWER_SUPPLY_PROP_POWER_AVG, &val) == 0) {
+                /* Store the value in the provided battery_status struct */
+                battery_status->power_avg = val.intval / 1000; /* uW to mW */
+            }
+
+            power_supply_put(psy);
+            return; /* We found our battery, no need to check others */
+        }
+        power_supply_put(psy);
+    }
 }
-
 /* lap_dbs_update - compute average load (0..100) across all CPUs in policy */
 static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_nice)
 {
@@ -170,7 +205,7 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
     unsigned int cur_load;
     u64 cur_idle, cur_nice;
     u64 idle_delta, nice_delta;
-    int battery_capacity;
+    battery_t battery_status;
 
     if (!lp || !cpumask_weight(policy->cpus))
         return 0;
@@ -178,12 +213,9 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
     /* Initialize core masks if not already done */
     if (cpumask_empty(&lp->eff_mask) || cpumask_empty(&lp->perf_mask)) {
         detect_clusters(policy, &lp->eff_mask, &lp->perf_mask);
-        eff_cpus = cpumask_weight(&lp->eff_mask);
-        perf_cpus = cpumask_weight(&lp->perf_mask);
-    } else {
-        eff_cpus = cpumask_weight(&lp->eff_mask);
-        perf_cpus = cpumask_weight(&lp->perf_mask);
     }
+    eff_cpus = cpumask_weight(&lp->eff_mask);
+    perf_cpus = cpumask_weight(&lp->perf_mask);
 
     /* Compute load for efficiency and performance cores separately */
     for_each_cpu(cpu, policy->cpus) {
@@ -218,21 +250,121 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
     }
 
     /* Calculate average load based on battery capacity */
-    if (eff_cpus && perf_cpus) {
+    if (eff_cpus > 0 && perf_cpus > 0) {
         unsigned int eff_load = eff_load_sum / eff_cpus;
         unsigned int perf_load = perf_load_sum / perf_cpus;
 
-        if (!lap_is_on_ac(&battery_capacity) && battery_capacity <= 20) {
-            /* Prioritize efficiency cores at low battery */
+        lap_is_on_ac(&battery_status);
+        if (battery_status.active && battery_status.remaining <= 20) {
             return eff_load;
         } else {
-            /* Weighted average: 60% efficiency, 40% performance */
-            return (eff_load * 6 + perf_load * 4) / 10;
+            return (eff_load * 7 + perf_load * 3) / 10;
         }
     }
 
-    /* Fallback to average load across all CPUs */
     return load_sum / cpumask_weight(policy->cpus);
+}
+
+/**
+ * isqrt - integer square root
+ * @n: the number to calculate the square root of
+ *
+ * A fast, purely integer-based square root function suitable for the kernel.
+ * It uses a bitwise binary search method.
+ */
+static u64 isqrt(u64 n)
+{
+    u64 root = 0;
+    u64 bit;
+    u64 trial;
+
+    bit = (n > 0xFFFFFFFFUL) ? (1UL << 62) : (1UL << 30);
+
+    while (bit > n)
+        bit >>= 2;
+
+    for (; bit != 0; bit >>= 2) {
+        trial = root + bit;
+        root >>= 1;
+        if (n >= trial) {
+            n -= trial;
+            root += bit;
+        }
+    }
+    return root;
+}
+
+/* adaptive_frequency_step_update - determine next freq step via optimizer */
+static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m, s64 v, unsigned int current_load)
+{
+    struct lap_policy_info *lp = policy->governor_data;
+    s32 trend_mw = m >> FP_SHIFT;
+    s64 volatility_mw2 = v >> FP_SHIFT;
+    s64 update_vector;
+    s32 freq_step = 0;
+    unsigned int requested_freq, step_khz;
+
+    if (volatility_mw2 > 0) {
+        u64 sqrt_v = isqrt((u64)volatility_mw2);
+        if (sqrt_v > 0) {
+            update_vector = div64_s64((s64)trend_mw << 8, sqrt_v);
+        } else {
+            update_vector = 0;
+        }
+    } else {
+        update_vector = 0;
+    }
+
+    /* **TUNING**: Adjust step sizes for better responsiveness */
+    if (update_vector > AFS_HIGH_THRESHOLD) {
+        freq_step = +2;
+    } else if (update_vector > AFS_LOW_THRESHOLD) {
+        freq_step = +1;
+    } else if (update_vector < -AFS_HIGH_THRESHOLD) {
+        freq_step = -4; /* More aggressive step-down for clear idle trend */
+    } else if (update_vector < -AFS_LOW_THRESHOLD) {
+        freq_step = -2; /* Stronger step-down for moderate idle trend */
+    }
+
+    /* **TUNING**: Strengthen the override condition */
+    if (current_load > lp->tuners.up_threshold && freq_step <= 0) {
+        /*
+         * Override only if the power trend is not clearly decreasing.
+         * A negative trend indicates the load is transient and about to drop.
+         */
+        if (trend_mw > -1000) { /* Threshold increased to -1000mW */
+            freq_step = +1;
+        }
+    }
+
+    /* Also, if load is very low, force a step-down regardless of optimizer */
+    if (current_load < lp->tuners.down_threshold && freq_step >= 0) {
+        freq_step = -1;
+    }
+
+    if (freq_step == 0) {
+        return;
+    }
+
+    requested_freq = lp->requested_freq;
+    step_khz = lap_get_freq_step_khz(&lp->tuners, policy);
+
+    if (freq_step > 0) {
+        requested_freq += (freq_step * step_khz);
+        if (requested_freq > policy->max)
+            requested_freq = policy->max;
+        cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
+    } else {
+        if (requested_freq > ((-freq_step) * step_khz))
+            requested_freq -= ((-freq_step) * step_khz);
+        else
+            requested_freq = policy->min;
+
+        if (requested_freq < policy->min)
+             requested_freq = policy->min;
+        cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
+    }
+    lp->requested_freq = requested_freq;
 }
 
 /* cs_dbs_update - apply Laputil decision logic for one policy */
@@ -240,12 +372,9 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 {
     struct lap_policy_info *lp = policy->governor_data;
     struct lap_tuners *tuners;
-    unsigned int requested_freq;
     unsigned int load;
-    unsigned int step_khz;
-    int bias;
-    int eff_up, eff_down;
-    int battery_capacity;
+    battery_t battery_status;
+    s64 current_power = 0;
 
     if (!lp)
         return HZ;
@@ -253,76 +382,32 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     tuners = &lp->tuners;
     mutex_lock(&lp->lock);
 
+    lap_is_on_ac(&battery_status);
+
+    if (battery_status.active) {
+        /* Sanity check: ignore absurdly high power values during boot */
+        if (battery_status.power_avg < 150000) { /* 150W limit */
+            current_power = battery_status.power_avg;
+        }
+    }
+
+    update_power_momentum_fixed(current_power);
+
     load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
+
     int load_delta = load - lp->prev_load;
     u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
     ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
     lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
 
-    requested_freq = lp->requested_freq;
-    if (requested_freq > policy->max || requested_freq < policy->min) {
-        requested_freq = policy->cur;
-        lp->requested_freq = requested_freq;
-    }
-
-    step_khz = lap_get_freq_step_khz(tuners, policy);
-
-    bias = tuners->powersave_bias;
-    if (lap_is_on_ac(&battery_capacity)) {
-        bias += LAP_DEF_POWERSAVE_BIAS_DEFAULT;
-    } else {
-        if (battery_capacity <= 20) {
-            bias += 10; // Stronger power saving at low battery
-        } else if (battery_capacity <= 50) {
-            bias += 5;  // Moderate power saving at medium battery
-        }
-    }
-
-    eff_up = (int)tuners->up_threshold + bias;
-    eff_down = (int)tuners->down_threshold + bias;
-
-    if (eff_up > 100) eff_up = 100;
-    if (eff_up < 1) eff_up = 1;
-    if (eff_down < 0) eff_down = 0;
-    if (eff_down >= eff_up) {
-        eff_down = eff_up - 1;
-        if (eff_down < 0)
-            eff_down = 0;
-    }
-
-    if (lp->smoothed_load > (unsigned int)eff_up) {
-        if (requested_freq != policy->max) {
-            requested_freq += step_khz;
-            if (requested_freq > policy->max)
-                requested_freq = policy->max;
-            cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
-            lp->requested_freq = requested_freq;
-        }
-        lp->idle_periods = 0;
-    } else if (load < (unsigned int)eff_down) {
-        lp->idle_periods++;
-        if (lp->idle_periods >= tuners->sampling_down_factor) {
-            if (requested_freq != policy->min) {
-                if (requested_freq > step_khz)
-                    requested_freq -= step_khz;
-                else
-                    requested_freq = policy->min;
-                cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
-                lp->requested_freq = requested_freq;
-            }
-            lp->idle_periods = 0;
-        }
-    } else {
-        lp->idle_periods = 0;
-    }
+    adaptive_frequency_step_update(policy, m_fp, v_fp, lp->smoothed_load);
 
     lp->prev_load = load;
-    lp->requested_freq = requested_freq;
     mutex_unlock(&lp->lock);
     return (unsigned long)tuners->sampling_rate * HZ;
 }
 
-/* Delayed work handler per policy */
+/* lap_work_handler - Delayed work handler per policy */
 static void lap_work_handler(struct work_struct *work)
 {
     struct lap_policy_info *lp = container_of(work, struct lap_policy_info, work.work);
@@ -333,7 +418,10 @@ static void lap_work_handler(struct work_struct *work)
     schedule_delayed_work_on(policy->cpu, &lp->work, delay_jiffies);
 }
 
-/* sysfs interface */
+/*
+ * sysfs interface for governor tunables
+ */
+
 #define lap_gov_attr(_name) \
 static struct kobj_attribute _name##_attr = { \
     .attr = { .name = #_name, .mode = 0644 }, \
@@ -358,7 +446,7 @@ static ssize_t show_sampling_rate(struct kobject *kobj, struct kobj_attribute *a
 }
 
 static ssize_t store_sampling_rate(struct kobject *kobj, struct kobj_attribute *attr,
-                                   const char *buf, size_t count)
+                                     const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -395,7 +483,7 @@ static ssize_t show_sampling_down_factor(struct kobject *kobj, struct kobj_attri
 }
 
 static ssize_t store_sampling_down_factor(struct kobject *kobj, struct kobj_attribute *attr,
-                                         const char *buf, size_t count)
+                                          const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -432,7 +520,7 @@ static ssize_t show_up_threshold(struct kobject *kobj, struct kobj_attribute *at
 }
 
 static ssize_t store_up_threshold(struct kobject *kobj, struct kobj_attribute *attr,
-                                 const char *buf, size_t count)
+                                  const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -473,7 +561,7 @@ static ssize_t show_down_threshold(struct kobject *kobj, struct kobj_attribute *
 }
 
 static ssize_t store_down_threshold(struct kobject *kobj, struct kobj_attribute *attr,
-                                   const char *buf, size_t count)
+                                      const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -484,7 +572,7 @@ static ssize_t store_down_threshold(struct kobject *kobj, struct kobj_attribute 
         return -EINVAL;
 
     ret = kstrtouint(buf, 10, &val);
-    if (ret || val < 0)
+    if (ret)
         return -EINVAL;
 
     mutex_lock(&lp->lock);
@@ -514,7 +602,7 @@ static ssize_t show_ignore_nice_load(struct kobject *kobj, struct kobj_attribute
 }
 
 static ssize_t store_ignore_nice_load(struct kobject *kobj, struct kobj_attribute *attr,
-                                     const char *buf, size_t count)
+                                          const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -551,7 +639,7 @@ static ssize_t show_freq_step(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static ssize_t store_freq_step(struct kobject *kobj, struct kobj_attribute *attr,
-                              const char *buf, size_t count)
+                                 const char *buf, size_t count)
 {
     unsigned int val;
     int ret;
@@ -571,56 +659,12 @@ static ssize_t store_freq_step(struct kobject *kobj, struct kobj_attribute *attr
     return count;
 }
 
-/* powersave_bias */
-static ssize_t show_powersave_bias(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
-    struct lap_policy_info *lp = policy->governor_data;
-    ssize_t ret;
-
-    if (!lp)
-        return snprintf(buf, 3, "0\n");
-
-    mutex_lock(&lp->lock);
-    ret = snprintf(buf, 5,"%d\n", lp->tuners.powersave_bias);
-    mutex_unlock(&lp->lock);
-    return ret;
-}
-
-static ssize_t store_powersave_bias(struct kobject *kobj, struct kobj_attribute *attr,
-                                    const char *buf, size_t count)
-{
-    int val;
-    int ret;
-    struct cpufreq_policy *policy = container_of(kobj, struct cpufreq_policy, kobj);
-    struct lap_policy_info *lp = policy->governor_data;
-
-    if (!lp)
-        return -EINVAL;
-
-    ret = kstrtoint(buf, 10, &val);
-    if (ret)
-        return -EINVAL;
-
-    if (val < LAP_POWERSAVE_BIAS_MIN)
-        val = LAP_POWERSAVE_BIAS_MIN;
-    if (val > LAP_POWERSAVE_BIAS_MAX)
-        val = LAP_POWERSAVE_BIAS_MAX;
-
-    mutex_lock(&lp->lock);
-    lp->tuners.powersave_bias = val;
-    mutex_unlock(&lp->lock);
-    return count;
-}
-
-/* declare attributes */
 lap_gov_attr(sampling_rate);
 lap_gov_attr(sampling_down_factor);
 lap_gov_attr(up_threshold);
 lap_gov_attr(down_threshold);
 lap_gov_attr(ignore_nice_load);
 lap_gov_attr(freq_step);
-lap_gov_attr(powersave_bias);
 
 static struct attribute *lap_attrs[] = {
     &sampling_rate_attr.attr,
@@ -629,7 +673,6 @@ static struct attribute *lap_attrs[] = {
     &down_threshold_attr.attr,
     &ignore_nice_load_attr.attr,
     &freq_step_attr.attr,
-    &powersave_bias_attr.attr,
     NULL
 };
 
@@ -638,10 +681,16 @@ static struct attribute_group lap_attr_group = {
     .name = "laputil",
 };
 
+/*
+ * Governor lifecycle functions (init, exit, start, stop)
+ */
+
+/* lap_start - Called when the governor is activated for a policy */
 static int lap_start(struct cpufreq_policy *policy)
 {
     struct lap_policy_info *lp = policy->governor_data;
     unsigned long delay;
+    battery_t battery_status;
 
     if (!lp)
         return -EINVAL;
@@ -650,6 +699,14 @@ static int lap_start(struct cpufreq_policy *policy)
     lp->requested_freq = policy->cur;
     lp->prev_load = 0;
     lp->idle_periods = 0;
+    
+    lap_is_on_ac(&battery_status);
+    lp->prev_remaining = battery_status.remaining;
+
+    /* Reset momentum values to start fresh */
+    m_fp = 0;
+    v_fp = 0;
+
     mutex_unlock(&lp->lock);
     
     delay = (unsigned long)lp->tuners.sampling_rate * HZ;
@@ -679,7 +736,6 @@ static int lap_init(struct cpufreq_policy *policy)
     lp->tuners.sampling_down_factor = LAP_DEF_SAMPLING_DOWN_FAC;
     lp->tuners.ignore_nice_load = 1;
     lp->tuners.sampling_rate = LAP_DEF_SAMPLING_RATE;
-    lp->tuners.powersave_bias = 0;
 
     lp->policy = policy;
     mutex_init(&lp->lock);
@@ -709,6 +765,10 @@ static void lap_exit(struct cpufreq_policy *policy)
     policy->governor_data = NULL;
 }
 
+/*
+ * Governor registration
+ */
+
 static struct cpufreq_governor cpufreq_gov_laputil = {
     .name = "laputil",
     .owner = THIS_MODULE,
@@ -730,7 +790,7 @@ static void __exit laputil_module_exit(void)
 }
 
 MODULE_AUTHOR("Lee Yunjin <gzblues61@daum.net>");
-MODULE_DESCRIPTION("'cpufreq_laputil' - Conservative-style governor for laptops (with powersave_bias)");
+MODULE_DESCRIPTION("'cpufreq_laputil' - Conservative-style governor for laptops (with adam-inspired optimizer)");
 MODULE_LICENSE("GPL");
 
 module_init(laputil_module_init);
