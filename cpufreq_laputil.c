@@ -43,8 +43,6 @@
 #define AFS_HIGH_THRESHOLD 150
 #define AFS_LOW_THRESHOLD  50
 
-static s64 m_fp = 0;
-static s64 v_fp = 0;
 
 struct lap_cpu_dbs {
     u64 prev_cpu_idle;
@@ -70,6 +68,8 @@ struct lap_policy_info {
     unsigned int prev_remaining;
     unsigned int idle_periods;
     unsigned int smoothed_load;
+    s64          v_fp;
+    s64          m_fp;
     struct lap_tuners tuners;
     struct delayed_work work;
     struct mutex lock;
@@ -93,14 +93,14 @@ struct lap_policy_info {
  * 'm' tracks the momentum (the direction of the update).
  * 'v' tracks the variance (to adaptively scale the update size).
  */
-static void update_power_momentum_fixed(s64 current_power)
+static void update_power_momentum_fixed(s64 current_power, struct lap_policy_info *lp)
 {
     s64 power_fp = current_power << FP_SHIFT;
     s64 power_sq_fp = (current_power * current_power) << FP_SHIFT;
 
-    m_fp = (((BETA1_FP * m_fp) >> FP_SHIFT) +
+    lp->m_fp = (((BETA1_FP * lp->m_fp) >> FP_SHIFT) +
             ((ONE_MINUS_BETA1_FP * power_fp) >> FP_SHIFT));
-    v_fp = (((BETA2_FP * v_fp) >> FP_SHIFT) +
+    lp->v_fp = (((BETA2_FP * lp->v_fp) >> FP_SHIFT) +
             ((ONE_MINUS_BETA2_FP * power_sq_fp) >> FP_SHIFT));
 }
 
@@ -393,7 +393,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
         }
     }
 
-    update_power_momentum_fixed(current_power);
+    update_power_momentum_fixed(current_power, lp);
 
     load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
 
@@ -402,7 +402,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
     ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
     lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
 
-    adaptive_frequency_step_update(policy, m_fp, v_fp, lp->smoothed_load);
+    adaptive_frequency_step_update(policy, lp->m_fp, lp->v_fp, lp->smoothed_load);
 
     lp->prev_load = load;
     mutex_unlock(&lp->lock);
@@ -706,8 +706,8 @@ static int lap_start(struct cpufreq_policy *policy)
     lp->prev_remaining = battery_status.remaining;
 
     /* Reset momentum values to start fresh */
-    m_fp = 0;
-    v_fp = 0;
+    lp->m_fp = 0;
+    lp->v_fp = 0;
 
     mutex_unlock(&lp->lock);
     
