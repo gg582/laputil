@@ -345,14 +345,14 @@ static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m,
 		scaled_update = 0;
 	}
 
-	_Bool override = 0;
+	_Bool override = 1;
 	if (current_load > lp->tuners.up_threshold) {
 		scaled_update = max_t(int, scaled_update, 1);
-		override = 1;
 	} else if (current_load < lp->tuners.down_threshold) {
 		scaled_update = min_t(int, scaled_update, -1);
-		override = 1;
-	}
+	} else {
+        override = 0;
+    }
 
 	if (scaled_update == 0 && !override) {
 		return;
@@ -363,13 +363,12 @@ static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m,
 		requested_freq += (scaled_update * step_khz);
 		if (requested_freq > policy->max)
 			requested_freq = policy->max;
-		cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
 	} else {
 		requested_freq -= ((-scaled_update) * step_khz);
 		if (requested_freq < policy->min)
 			requested_freq = policy->min;
-		cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
 	}
+	cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
 
 	lp->requested_freq = requested_freq;
 }
