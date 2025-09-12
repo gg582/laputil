@@ -150,7 +150,7 @@ static inline void lap_is_on_ac(battery_t *battery_status)
     struct power_supply *psy;
     union power_supply_propval val;
     int i;
-    bool found_ac = false;
+    bool found_ac = 0;
 
     /* Default to on-battery, 100% capacity, 0 power draw */
     battery_status->active = 1;
@@ -164,7 +164,7 @@ static inline void lap_is_on_ac(battery_t *battery_status)
             continue;
 
         if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) == 0 && val.intval) {
-            found_ac = true;
+            found_ac = 1;
             power_supply_put(psy);
             break; /* If any AC adapter is online, we are on AC power */
         }
@@ -301,74 +301,78 @@ static u64 isqrt(u64 n)
 /* adaptive_frequency_step_update - determine next freq step via optimizer */
 static void adaptive_frequency_step_update(struct cpufreq_policy *policy, s64 m, s64 v, unsigned int current_load)
 {
-    struct lap_policy_info *lp = policy->governor_data;
-    s32 trend_mw = m >> FP_SHIFT;
-    s64 volatility_mw2 = v >> FP_SHIFT;
-    s64 update_vector = 0;
-    s32 freq_step = 0;
-    unsigned int requested_freq, step_khz;
+	struct lap_policy_info *lp = policy->governor_data;
+	unsigned int requested_freq = lp->requested_freq;
+	unsigned int step_khz = lap_get_freq_step_khz(&lp->tuners, policy);
+	s64 update_vector = 0;
+	s32 freq_change_scalar;
+	s32 scaled_update;
 
-    if (volatility_mw2 > 0) {
-        u64 sqrt_v = isqrt((u64)volatility_mw2);
-        if (sqrt_v > 0) {
-            update_vector = div64_s64((s64)trend_mw << 8, sqrt_v);
-        }
-    }
+	/*
+	 * Compute the update vector from the momentum (m) and variance (v).
+	 * This is a simplified version of the Adam update rule: m / sqrt(v).
+	 * It indicates the direction and magnitude of the change needed.
+	 */
+	s64 trend_fp = m;
+	s64 volatility_fp = v;
 
-    /* **TUNING**: Adjust step sizes for better responsiveness */
-    if (update_vector > AFS_HIGH_THRESHOLD) {
-        freq_step = +2;
-    } else if (update_vector > AFS_LOW_THRESHOLD) {
-        freq_step = +1;
-    } else if (update_vector < -AFS_HIGH_THRESHOLD) {
-        freq_step = -4; /* More aggressive step-down for clear idle trend */
-    } else if (update_vector < -AFS_LOW_THRESHOLD) {
-        freq_step = -2; /* Stronger step-down for moderate idle trend */
-    } else {
-        freq_step = 0; // do nothing when update_vector is weak enough
-    }
+	if (volatility_fp > 0) {
+		u64 sqrt_v = isqrt((u64)volatility_fp >> FP_SHIFT);
+		if (sqrt_v > 0) {
+			update_vector = div64_s64(trend_fp, sqrt_v);
+		}
+	}
 
-    /* **TUNING**: Strengthen the override condition */
-    if (current_load > lp->tuners.up_threshold && freq_step <= 0) {
-        /*
-         * Override only if the power trend is not clearly decreasing.
-         * A negative trend indicates the load is transient and about to drop.
-         */
-        if (trend_mw > -1000) { /* Threshold increased to -1000mW */
-            freq_step = +1;
-        }
-    }
+	/*
+	 * Dynamically scale the frequency step based on the magnitude
+	 * of the update_vector. This makes the governor more aggressive
+	 * when a large frequency change is warranted.
+	 */
+	if (abs(update_vector) > AFS_HIGH_THRESHOLD) {
+		freq_change_scalar = 3;
+	} else if (abs(update_vector) > AFS_LOW_THRESHOLD) {
+		freq_change_scalar = 2;
+	} else {
+		freq_change_scalar = 1;
+	}
 
-    /* Also, if load is very low, force a step-down regardless of optimizer */
-    if (current_load < lp->tuners.down_threshold && freq_step >= 0) {
-        freq_step = -1;
-    }
+	/* Determine the direction of the frequency change. */
+	if (update_vector > 0) {
+		scaled_update = freq_change_scalar;
+	} else if (update_vector < 0) {
+		scaled_update = -freq_change_scalar;
+	} else {
+		scaled_update = 0;
+	}
 
-    if (freq_step == 0) {
-        return;
-    }
+	_Bool override = 0;
+	if (current_load > lp->tuners.up_threshold) {
+		scaled_update = max_t(int, scaled_update, 1);
+		override = 1;
+	} else if (current_load < lp->tuners.down_threshold) {
+		scaled_update = min_t(int, scaled_update, -1);
+		override = 1;
+	}
 
-    requested_freq = lp->requested_freq;
-    step_khz = lap_get_freq_step_khz(&lp->tuners, policy);
+	if (scaled_update == 0 && !override) {
+		return;
+	}
 
-    if (freq_step > 0) {
-        requested_freq += (freq_step * step_khz);
-        if (requested_freq > policy->max)
-            requested_freq = policy->max;
-        cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
-    } else {
-        if (requested_freq > ((-freq_step) * step_khz))
-            requested_freq -= ((-freq_step) * step_khz);
-        else
-            requested_freq = policy->min;
+	/* Apply the final calculated frequency change. */
+	if (scaled_update > 0) {
+		requested_freq += (scaled_update * step_khz);
+		if (requested_freq > policy->max)
+			requested_freq = policy->max;
+		cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
+	} else {
+		requested_freq -= ((-scaled_update) * step_khz);
+		if (requested_freq < policy->min)
+			requested_freq = policy->min;
+		cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
+	}
 
-        if (requested_freq < policy->min)
-             requested_freq = policy->min;
-        cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
-    }
-    lp->requested_freq = requested_freq;
+	lp->requested_freq = requested_freq;
 }
-
 /* cs_dbs_update - apply Laputil decision logic for one policy */
 static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 {
