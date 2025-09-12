@@ -37,7 +37,7 @@
 #define ONE_MINUS_BETA1_FP (FP_SCALE - BETA1_FP)
 #define ONE_MINUS_BETA2_FP (FP_SCALE - BETA2_FP)
 
-#define AFS_HIGH_THRESHOLD 150
+#define AFS_HIGH_THRESHOLD 200
 #define AFS_LOW_THRESHOLD  50
 
 
@@ -90,7 +90,7 @@ struct lap_policy_info {
 #define LAP_MIN_FREQ_STEP_PERCENT         5
 #define LAP_DEF_LOAD_EMA_ALPHA_SCALING_FACTOR  3
 #define LAP_DEF_POWER_EMA_ALPHA_FP (FP_SCALE / 10)
-#define LAP_DEF_TARGET_POWER_MW 5000
+#define LAP_DEF_TARGET_POWER_MW 2000
 
 /* Function Prototypes */
 static void update_mse_momentum_fixed(s64 gradient, struct lap_policy_info *lp);
