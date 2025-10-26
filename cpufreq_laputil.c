@@ -63,7 +63,7 @@ struct lap_policy_info {
     struct cpumask perf_mask; /* Performance cores mask */
 };
 
-#define LAP_DEF_UP_THRESHOLD          75
+#define LAP_DEF_UP_THRESHOLD          70
 #define LAP_DEF_DOWN_THRESHOLD        10
 #define LAP_DEF_FREQ_STEP             5
 #define LAP_DEF_SAMPLING_DOWN_FAC     2
