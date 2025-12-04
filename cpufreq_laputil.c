@@ -210,6 +210,14 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
 		struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
 
 		cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
+    if (cur_idle == (u64)-1) {
+      // idle time accounting not supported on this arch/cpu
+      // conservative fallback: assume fully busy or skip
+      cdbs->prev_update_time = cur_time;
+      cdbs->prev_cpu_idle = 0;
+      cdbs->prev_cpu_nice = 0;
+      continue;
+    }
 		cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
 
 		time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
