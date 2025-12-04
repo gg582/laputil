@@ -47,7 +47,7 @@ struct lap_tuners {
     unsigned int sampling_down_factor; /* how many sampling intervals to wait before down */
     unsigned int ignore_nice_load;     /* boolean (preserved but unused here) */
     unsigned int sampling_rate;        /* seconds between samples */
-    int powersave_bias;                /* signed bias (-100 .. 100) */
+    int powersave_bias;                /* 0..10 base bias, plus dynamic adjustments */
 };
 
 struct lap_policy_info {
@@ -79,26 +79,41 @@ struct lap_policy_info {
 /* Detect efficiency and performance cores based on max frequency */
 static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask *perf_mask)
 {
-    unsigned int cpu;
-    unsigned int eff_max_freq = UINT_MAX, perf_max_freq = 0;
+	unsigned int cpu;
+	unsigned int min_freq = UINT_MAX, max_freq = 0;
+	unsigned int current_max_freq;
 
-    cpumask_clear(eff_mask);
-    cpumask_clear(perf_mask);
+	/* Pass 1: Find the absolute min and max frequencies in the policy */
+	for_each_cpu(cpu, policy->cpus) {
+		current_max_freq = cpufreq_quick_get_max(cpu);
+		if (current_max_freq < min_freq)
+			min_freq = current_max_freq;
+		if (current_max_freq > max_freq)
+			max_freq = current_max_freq;
+	}
 
-    for_each_cpu(cpu, policy->cpus) {
-        unsigned int max_freq = cpufreq_quick_get_max(cpu);
-        if (max_freq < eff_max_freq) {
-            eff_max_freq = max_freq;
-            cpumask_set_cpu(cpu, eff_mask);
-        }
-        if (max_freq > perf_max_freq) {
-            perf_max_freq = max_freq;
-            cpumask_set_cpu(cpu, perf_mask);
-        }
-    }
+	cpumask_clear(eff_mask);
+	cpumask_clear(perf_mask);
 
-    pr_info("Detected %u efficiency cores (max_freq: %u kHz), %u performance cores (max_freq: %u kHz)\n",
-            cpumask_weight(eff_mask), eff_max_freq, cpumask_weight(perf_mask), perf_max_freq);
+	/* Handle the edge case where all cores have the same frequency */
+	if (min_freq == max_freq) {
+		cpumask_copy(perf_mask, policy->cpus);
+		pr_info("Detected single cluster (%u cores, max_freq: %u kHz)\n",
+			cpumask_weight(perf_mask), max_freq);
+		return;
+	}
+
+	/* Pass 2: Populate masks based on the found min and max frequencies */
+	for_each_cpu(cpu, policy->cpus) {
+		current_max_freq = cpufreq_quick_get_max(cpu);
+		if (current_max_freq == min_freq)
+			cpumask_set_cpu(cpu, eff_mask);
+		else if (current_max_freq == max_freq)
+			cpumask_set_cpu(cpu, perf_mask);
+	}
+
+	pr_info("Detected %u efficiency cores (max_freq: %u kHz), %u performance cores (max_freq: %u kHz)\n",
+		cpumask_weight(eff_mask), min_freq, cpumask_weight(perf_mask), max_freq);
 }
 
 /* Compute freq step in kHz from percent of policy->max */
@@ -134,9 +149,12 @@ static inline _Bool lap_is_on_ac(int *battery_capacity)
             if (psy == NULL)
                 continue;
             if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-                if (val.intval)
+                if (val.intval) {
+                    power_supply_put(psy);
                     return 1;
+                }
             }
+            power_supply_put(psy);
         }
     }
 
@@ -149,9 +167,11 @@ static inline _Bool lap_is_on_ac(int *battery_capacity)
                 if (val.intval) {
                     if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val))
                         *battery_capacity = val.intval;
+                    power_supply_put(psy);
                     return 0;
                 }
             }
+            power_supply_put(psy);
         }
     }
 
@@ -159,167 +179,173 @@ static inline _Bool lap_is_on_ac(int *battery_capacity)
 }
 
 /* lap_dbs_update - compute average load (0..100) across all CPUs in policy */
-static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_nice)
+static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_nice,
+				   bool on_ac, int battery_capacity)
 {
-    struct lap_policy_info *lp = policy->governor_data;
-    unsigned int load_sum = 0, eff_load_sum = 0, perf_load_sum = 0;
-    unsigned int cpu;
-    unsigned int eff_cpus = 0, perf_cpus = 0;
-    u64 cur_time;
-    unsigned int time_elapsed;
-    unsigned int cur_load;
-    u64 cur_idle, cur_nice;
-    u64 idle_delta, nice_delta;
-    int battery_capacity;
+	struct lap_policy_info *lp = policy->governor_data;
+	unsigned int load_sum = 0, eff_load_sum = 0, perf_load_sum = 0;
+	unsigned int cpu;
+	unsigned int eff_cpus = 0, perf_cpus = 0;
+	u64 cur_time;
+	unsigned int time_elapsed;
+	unsigned int cur_load;
+	u64 cur_idle, cur_nice;
+	u64 idle_delta, nice_delta;
 
-    if (!lp || !cpumask_weight(policy->cpus))
-        return 0;
+	if (!lp || !cpumask_weight(policy->cpus))
+		return 0;
 
-    /* Initialize core masks if not already done */
-    if (cpumask_empty(&lp->eff_mask) || cpumask_empty(&lp->perf_mask)) {
-        detect_clusters(policy, &lp->eff_mask, &lp->perf_mask);
-        eff_cpus = cpumask_weight(&lp->eff_mask);
-        perf_cpus = cpumask_weight(&lp->perf_mask);
-    } else {
-        eff_cpus = cpumask_weight(&lp->eff_mask);
-        perf_cpus = cpumask_weight(&lp->perf_mask);
-    }
+	/* Initialize core masks if not already done */
+	if (cpumask_empty(&lp->eff_mask) || cpumask_empty(&lp->perf_mask)) {
+		detect_clusters(policy, &lp->eff_mask, &lp->perf_mask);
+		eff_cpus = cpumask_weight(&lp->eff_mask);
+		perf_cpus = cpumask_weight(&lp->perf_mask);
+	} else {
+		eff_cpus = cpumask_weight(&lp->eff_mask);
+		perf_cpus = cpumask_weight(&lp->perf_mask);
+	}
 
-    /* Compute load for efficiency and performance cores separately */
-    for_each_cpu(cpu, policy->cpus) {
-        struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
+	/* Compute load for efficiency and performance cores separately */
+	for_each_cpu(cpu, policy->cpus) {
+		struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
 
-        cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
-        cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
+		cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
+		cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
 
-        time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
-        idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
-        nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice);
+		time_elapsed = (unsigned int)(cur_time - cdbs->prev_update_time);
+		idle_delta = (unsigned int)(cur_idle - cdbs->prev_cpu_idle);
+		nice_delta = (unsigned int)(cur_nice - cdbs->prev_cpu_nice);
 
-        if (unlikely(time_elapsed == 0)) {
-            cur_load = 100;
-        } else {
-            unsigned int busy_time = time_elapsed - idle_delta;
-            if (ignore_nice)
-                busy_time -= nice_delta;
-            cur_load = 100 * busy_time / time_elapsed;
-        }
+		if (unlikely(time_elapsed == 0)) {
+			cur_load = 100;
+		} else {
+			int busy_time = time_elapsed - idle_delta;
+			if (ignore_nice)
+				busy_time -= nice_delta;
 
-        cdbs->prev_cpu_idle = cur_idle;
-        cdbs->prev_cpu_nice = cur_nice;
-        cdbs->prev_update_time = cur_time;
+			if (busy_time < 0)
+				busy_time = 0;
+			cur_load = 100 * busy_time / time_elapsed;
+		}
 
-        if (cpumask_test_cpu(cpu, &lp->eff_mask)) {
-            eff_load_sum += cur_load;
-        } else if (cpumask_test_cpu(cpu, &lp->perf_mask)) {
-            perf_load_sum += cur_load;
-        }
-        load_sum += cur_load;
-    }
+		cdbs->prev_cpu_idle = cur_idle;
+		cdbs->prev_cpu_nice = cur_nice;
+		cdbs->prev_update_time = cur_time;
 
-    /* Calculate average load based on battery capacity */
-    if (eff_cpus && perf_cpus) {
-        unsigned int eff_load = eff_load_sum / eff_cpus;
-        unsigned int perf_load = perf_load_sum / perf_cpus;
+		if (cpumask_test_cpu(cpu, &lp->eff_mask)) {
+			eff_load_sum += cur_load;
+		} else if (cpumask_test_cpu(cpu, &lp->perf_mask)) {
+			perf_load_sum += cur_load;
+		}
+		load_sum += cur_load;
+	}
 
-        if (!lap_is_on_ac(&battery_capacity) && battery_capacity <= 20) {
-            /* Prioritize efficiency cores at low battery */
-            return eff_load;
-        } else {
-            /* Weighted average: 60% efficiency, 40% performance */
-            return (eff_load * 6 + perf_load * 4) / 10;
-        }
-    }
+	/* Calculate average load based on battery capacity */
+	if (eff_cpus && perf_cpus) {
+		unsigned int eff_load = eff_load_sum / eff_cpus;
+		unsigned int perf_load = perf_load_sum / perf_cpus;
 
-    /* Fallback to average load across all CPUs */
-    return load_sum / cpumask_weight(policy->cpus);
+		if (!on_ac && battery_capacity <= 20) {
+			/* Prioritize efficiency cores at low battery */
+			return eff_load;
+		} else {
+			/* Weighted average: 60% efficiency, 40% performance */
+			return (eff_load * 6 + perf_load * 4) / 10;
+		}
+	}
+
+	/* Fallback to average load across all CPUs */
+	return load_sum / cpumask_weight(policy->cpus);
 }
 
 /* cs_dbs_update - apply Laputil decision logic for one policy */
 static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 {
-    struct lap_policy_info *lp = policy->governor_data;
-    struct lap_tuners *tuners;
-    unsigned int requested_freq;
-    unsigned int load;
-    unsigned int step_khz;
-    int bias;
-    int eff_up, eff_down;
-    int battery_capacity;
+	struct lap_policy_info *lp = policy->governor_data;
+	struct lap_tuners *tuners;
+	unsigned int requested_freq;
+	unsigned int load;
+	unsigned int step_khz;
+	int bias;
+	int eff_up, eff_down;
+	int battery_capacity;
+	bool on_ac;
 
-    if (!lp)
-        return HZ;
+	if (!lp)
+		return HZ;
 
-    tuners = &lp->tuners;
-    mutex_lock(&lp->lock);
+	tuners = &lp->tuners;
+	mutex_lock(&lp->lock);
 
-    load = lap_dbs_update(policy, lp->tuners.ignore_nice_load);
-    int load_delta = load - lp->prev_load;
-    u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
-    ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
-    lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
+	on_ac = lap_is_on_ac(&battery_capacity);
+	load = lap_dbs_update(policy, lp->tuners.ignore_nice_load, on_ac,
+			      battery_capacity);
+	int load_delta = load - lp->prev_load;
+	u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
+	ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
+	lp->smoothed_load = (ema_alpha * load + (100 - ema_alpha) * lp->smoothed_load) / 100;
 
-    requested_freq = lp->requested_freq;
-    if (requested_freq > policy->max || requested_freq < policy->min) {
-        requested_freq = policy->cur;
-        lp->requested_freq = requested_freq;
-    }
+	requested_freq = lp->requested_freq;
+	if (requested_freq > policy->max || requested_freq < policy->min) {
+		requested_freq = policy->cur;
+		lp->requested_freq = requested_freq;
+	}
 
-    step_khz = lap_get_freq_step_khz(tuners, policy);
+	step_khz = lap_get_freq_step_khz(tuners, policy);
 
-    bias = tuners->powersave_bias;
-    if (lap_is_on_ac(&battery_capacity)) {
-        bias += LAP_DEF_POWERSAVE_BIAS_DEFAULT;
-    } else {
-        if (battery_capacity <= 20) {
-            bias += 10; // Stronger power saving at low battery
-        } else if (battery_capacity <= 50) {
-            bias += 5;  // Moderate power saving at medium battery
-        }
-    }
+	bias = tuners->powersave_bias;
+	if (on_ac) {
+		bias += LAP_DEF_POWERSAVE_BIAS_DEFAULT;
+	} else {
+		if (battery_capacity <= 20) {
+			bias += 10; // Stronger power saving at low battery
+		} else if (battery_capacity <= 50) {
+			bias += 5;  // Moderate power saving at medium battery
+		}
+	}
 
-    eff_up = (int)tuners->up_threshold + bias;
-    eff_down = (int)tuners->down_threshold + bias;
+	eff_up = (int)tuners->up_threshold + bias;
+	eff_down = (int)tuners->down_threshold + bias;
 
-    if (eff_up > 100) eff_up = 100;
-    if (eff_up < 1) eff_up = 1;
-    if (eff_down < 0) eff_down = 0;
-    if (eff_down >= eff_up) {
-        eff_down = eff_up - 1;
-        if (eff_down < 0)
-            eff_down = 0;
-    }
+	if (eff_up > 100) eff_up = 100;
+	if (eff_up < 1) eff_up = 1;
+	if (eff_down < 0) eff_down = 0;
+	if (eff_down >= eff_up) {
+		eff_down = eff_up - 1;
+		if (eff_down < 0)
+			eff_down = 0;
+	}
 
-    if (lp->smoothed_load > (unsigned int)eff_up) {
-        if (requested_freq != policy->max) {
-            requested_freq += step_khz;
-            if (requested_freq > policy->max)
-                requested_freq = policy->max;
-            cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
-            lp->requested_freq = requested_freq;
-        }
-        lp->idle_periods = 0;
-    } else if (load < (unsigned int)eff_down) {
-        lp->idle_periods++;
-        if (lp->idle_periods >= tuners->sampling_down_factor) {
-            if (requested_freq != policy->min) {
-                if (requested_freq > step_khz)
-                    requested_freq -= step_khz;
-                else
-                    requested_freq = policy->min;
-                cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
-                lp->requested_freq = requested_freq;
-            }
-            lp->idle_periods = 0;
-        }
-    } else {
-        lp->idle_periods = 0;
-    }
+	if (lp->smoothed_load > (unsigned int)eff_up) {
+		if (requested_freq != policy->max) {
+			requested_freq += step_khz;
+			if (requested_freq > policy->max)
+				requested_freq = policy->max;
+			cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_H);
+			lp->requested_freq = requested_freq;
+		}
+		lp->idle_periods = 0;
+	} else if (load < (unsigned int)eff_down) {
+		lp->idle_periods++;
+		if (lp->idle_periods >= tuners->sampling_down_factor) {
+			if (requested_freq != policy->min) {
+				if (requested_freq > step_khz)
+					requested_freq -= step_khz;
+				else
+					requested_freq = policy->min;
+				cpufreq_driver_target(policy, requested_freq, CPUFREQ_RELATION_L);
+				lp->requested_freq = requested_freq;
+			}
+			lp->idle_periods = 0;
+		}
+	} else {
+		lp->idle_periods = 0;
+	}
 
-    lp->prev_load = load;
-    lp->requested_freq = requested_freq;
-    mutex_unlock(&lp->lock);
-    return (unsigned long)tuners->sampling_rate * HZ;
+	lp->prev_load = load;
+	lp->requested_freq = requested_freq;
+	mutex_unlock(&lp->lock);
+	return (unsigned long)tuners->sampling_rate * HZ;
 }
 
 /* Delayed work handler per policy */
@@ -484,7 +510,7 @@ static ssize_t store_down_threshold(struct kobject *kobj, struct kobj_attribute 
         return -EINVAL;
 
     ret = kstrtouint(buf, 10, &val);
-    if (ret || val < 0)
+    if (ret)
         return -EINVAL;
 
     mutex_lock(&lp->lock);
@@ -640,21 +666,36 @@ static struct attribute_group lap_attr_group = {
 
 static int lap_start(struct cpufreq_policy *policy)
 {
-    struct lap_policy_info *lp = policy->governor_data;
-    unsigned long delay;
+	struct lap_policy_info *lp = policy->governor_data;
+	unsigned long delay;
+	unsigned int cpu;
 
-    if (!lp)
-        return -EINVAL;
+	if (!lp)
+		return -EINVAL;
 
-    mutex_lock(&lp->lock);
-    lp->requested_freq = policy->cur;
-    lp->prev_load = 0;
-    lp->idle_periods = 0;
-    mutex_unlock(&lp->lock);
-    
-    delay = (unsigned long)lp->tuners.sampling_rate * HZ;
-    schedule_delayed_work_on(policy->cpu, &lp->work, delay);
-    return 0;
+	for_each_cpu(cpu, policy->cpus) {
+		struct lap_cpu_dbs *cdbs = per_cpu_ptr(&lap_cpu_dbs, cpu);
+		u64 cur_time;
+		u64 cur_idle;
+		u64 cur_nice;
+
+		cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
+		cur_nice = jiffies_to_usecs(kcpustat_cpu(cpu).cpustat[CPUTIME_NICE]);
+
+		cdbs->prev_cpu_idle = cur_idle;
+		cdbs->prev_cpu_nice = cur_nice;
+		cdbs->prev_update_time = cur_time;
+	}
+
+	mutex_lock(&lp->lock);
+	lp->requested_freq = policy->cur;
+	lp->prev_load = 0;
+	lp->idle_periods = 0;
+	mutex_unlock(&lp->lock);
+
+	delay = (unsigned long)lp->tuners.sampling_rate * HZ;
+	schedule_delayed_work_on(policy->cpu, &lp->work, delay);
+	return 0;
 }
 
 static void lap_stop(struct cpufreq_policy *policy)
