@@ -48,6 +48,8 @@ struct lap_tuners {
     unsigned int ignore_nice_load;     /* boolean (preserved but unused here) */
     unsigned int sampling_rate;        /* seconds between samples */
     int powersave_bias;                /* 0..10 base bias, plus dynamic adjustments */
+    _Bool last_on_ac;
+    int last_battery_capacity;
 };
 
 struct lap_policy_info {
@@ -75,6 +77,7 @@ struct lap_policy_info {
 #define LAP_MAX_FREQ_STEP_PERCENT     25
 #define LAP_MIN_FREQ_STEP_PERCENT     5
 #define LAP_DEF_EMA_ALPHA_SCALING_FACTOR 3
+#define LAP_DEF_SYSTEM_IDLE_THRESHOLD 5
 
 /* Detect efficiency and performance cores based on max frequency */
 static void detect_clusters(struct cpufreq_policy *policy, struct cpumask *eff_mask, struct cpumask *perf_mask)
@@ -141,38 +144,29 @@ static inline _Bool lap_is_on_ac(int *battery_capacity)
     union power_supply_propval val;
     int i;
 
-    *battery_capacity = 100; // Default to full capacity if unknown
+    *battery_capacity = 50; /* Default to 50% capacity if status unknown */
 
-    if (ARRAY_SIZE(ac_names) > 0) {
-        for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
-            psy = power_supply_get_by_name(ac_names[i]);
-            if (psy == NULL)
-                continue;
-            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-                if (val.intval) {
-                    power_supply_put(psy);
-                    return 1;
-                }
-            }
+    /* * Optimization: Check AC status first.
+     * Returns immediately if any AC source is online.
+     */
+    for (i = 0; i < ARRAY_SIZE(ac_names) && ac_names[i] != NULL; i++) {
+        psy = power_supply_get_by_name(ac_names[i]);
+        if (!psy) continue;
+        if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) && val.intval) {
             power_supply_put(psy);
+            return 1;
         }
+        power_supply_put(psy);
     }
 
-    if (ARRAY_SIZE(battery_names) > 0) {
-        for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
-            psy = power_supply_get_by_name(battery_names[i]);
-            if (psy == NULL)
-                continue;
-            if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val)) {
-                if (val.intval) {
-                    if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val))
-                        *battery_capacity = val.intval;
-                    power_supply_put(psy);
-                    return 0;
-                }
-            }
-            power_supply_put(psy);
-        }
+    /* Check battery capacity only if AC is offline */
+    for (i = 0; i < ARRAY_SIZE(battery_names) && battery_names[i] != NULL; i++) {
+        psy = power_supply_get_by_name(battery_names[i]);
+        if (!psy) continue;
+        if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val))
+            *battery_capacity = val.intval;
+        power_supply_put(psy);
+        return 0; /* Assume battery mode if battery device exists */
     }
 
     return 0;
@@ -274,6 +268,7 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 	unsigned int requested_freq;
 	unsigned int load;
 	unsigned int step_khz;
+  unsigned long next_delay;
 	int bias;
 	int eff_up, eff_down;
 	int battery_capacity;
@@ -285,9 +280,22 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 	tuners = &lp->tuners;
 	mutex_lock(&lp->lock);
 
-	on_ac = lap_is_on_ac(&battery_capacity);
+  // Update power status only once every 5 cycles to reduce sysfs/kobject wakeups
+  if (lp->idle_periods % 5 == 0) {
+    lp->tuners.last_on_ac = lap_is_on_ac(&lp->tuners.last_battery_capacity);
+  }
+
+  on_ac = lp->tuners.last_on_ac;
+  battery_capacity = lp->tuners.last_battery_capacity;
+
 	load = lap_dbs_update(policy, lp->tuners.ignore_nice_load, on_ac,
-			      battery_capacity);
+	       battery_capacity);
+  if (load < LAP_DEF_SYSTEM_IDLE_THRESHOLD && lp->smoothed_load < LAP_DEF_SYSTEM_IDLE_THRESHOLD) {
+    next_delay = (unsigned long)tuners->sampling_rate * HZ * 2;
+  } else {
+    next_delay = (unsigned long)tuners->sampling_rate * HZ;
+  }
+
 	int load_delta = load - lp->prev_load;
 	u8 ema_alpha = (load_delta + 100) / LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
 	ema_alpha = ema_alpha < 30 ? 30 : ema_alpha;
@@ -364,7 +372,6 @@ static void lap_work_handler(struct work_struct *work)
     unsigned long delay_jiffies;
 
     delay_jiffies = cs_dbs_update(policy);
-    schedule_delayed_work_on(policy->cpu, &lp->work, delay_jiffies);
 }
 
 /* sysfs interface */
@@ -702,7 +709,6 @@ static int lap_start(struct cpufreq_policy *policy)
 	mutex_unlock(&lp->lock);
 
 	delay = (unsigned long)lp->tuners.sampling_rate * HZ;
-	schedule_delayed_work_on(policy->cpu, &lp->work, delay);
 	return 0;
 }
 
@@ -734,7 +740,7 @@ static int lap_init(struct cpufreq_policy *policy)
     mutex_init(&lp->lock);
     cpumask_clear(&lp->eff_mask);
     cpumask_clear(&lp->perf_mask);
-    INIT_DELAYED_WORK(&lp->work, lap_work_handler);
+    INIT_DEFERRABLE_WORK(&lp->work, lap_work_handler);
 
     policy->governor_data = lp;
 
