@@ -372,6 +372,7 @@ static void lap_work_handler(struct work_struct *work)
     unsigned long delay_jiffies;
 
     delay_jiffies = cs_dbs_update(policy);
+    schedule_delayed_work_on(policy->cpu, &lp->work, delay_jiffies);
 }
 
 /* sysfs interface */
@@ -709,6 +710,7 @@ static int lap_start(struct cpufreq_policy *policy)
 	mutex_unlock(&lp->lock);
 
 	delay = (unsigned long)lp->tuners.sampling_rate * HZ;
+  schedule_delayed_work_on(policy->cpu, &lp->work, delay);
 	return 0;
 }
 
