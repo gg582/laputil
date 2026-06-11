@@ -19,7 +19,6 @@ The governor calculates a smoothed load value using an Exponential Moving Averag
 - Low Volatility: During steady workloads (like video playback), alpha decreases, prioritizing stability and power efficiency.
 - **Dynamic EMA Alpha using Load Delta**: EMA Alpha is automatically calculated via CPU Load delta. 
 #### Battery Awareness
-Battery Awareness
 
 `laputil` automatically detects whether the system is running on AC power or battery. It then applies a dynamic adjustment to the `powersave_bias` tunable:
 
