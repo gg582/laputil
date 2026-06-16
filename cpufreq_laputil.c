@@ -323,8 +323,10 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 	 */
 	if (refresh_power)
 		on_ac = lap_is_on_ac(&battery_capacity);
-	else
+	else {
 		on_ac = READ_ONCE(lp->tuners.last_on_ac);
+        battery_capacity = READ_ONCE(lp->tuners.last_battery_capacity);
+    }
 
 	load = lap_dbs_update(policy, tuners.ignore_nice_load, on_ac, battery_capacity);
 
