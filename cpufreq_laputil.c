@@ -91,19 +91,19 @@ struct lap_policy_info {
 	bool clusters_initialized;
 };
 
-#define LAP_DEF_UP_THRESHOLD			75
+#define LAP_DEF_UP_THRESHOLD			85
 #define LAP_DEF_DOWN_THRESHOLD			15
-#define LAP_DEF_FREQ_STEP			5
+#define LAP_DEF_FREQ_STEP			3
 #define LAP_DEF_SAMPLING_DOWN_FAC		2
 #define LAP_MAX_SAMPLING_DOWN_FAC		10
 #define LAP_DEF_SAMPLING_RATE			1
 #define LAP_POWERSAVE_BIAS_MIN			0
 #define LAP_POWERSAVE_BIAS_MAX			10
-#define LAP_DEF_POWERSAVE_BIAS_DEFAULT		1
-#define LAP_DEF_EMA_ALPHA_SCALING_FACTOR	3
+#define LAP_DEF_POWERSAVE_BIAS_DEFAULT		2
+#define LAP_DEF_EMA_ALPHA_SCALING_FACTOR	5
 #define LAP_DEF_SYSTEM_IDLE_THRESHOLD		5
-#define LAP_DEF_MIN_FREQ_STEP_PERCENT		5
-#define LAP_DEF_MAX_FREQ_STEP_PERCENT		25
+#define LAP_DEF_MIN_FREQ_STEP_PERCENT		3
+#define LAP_DEF_MAX_FREQ_STEP_PERCENT		12
 #define LAP_DEF_ECORE_SATURATION_THRESHOLD	90
 
 /*
@@ -115,7 +115,7 @@ struct lap_policy_info {
 /*
  * Confidence threshold above which Richardson extrapolation is trusted.
  */
-#define LAP_RICHARDSON_CONFIDENCE_THRESHOLD	70
+#define LAP_RICHARDSON_CONFIDENCE_THRESHOLD	85
 
 /*
  * detect_clusters - Classify CPUs into efficiency and performance clusters
@@ -245,41 +245,43 @@ static inline _Bool lap_is_on_ac(int *battery_capacity)
 }
 
 /*
- * lap_compute_richardson_load - Confidence-weighted Richardson extrapolation.
+ * lap_compute_richardson_delta - Confidence-weighted Richardson extrapolation.
  *
  * The raw Richardson formula L = 2*F(h) - F(2h) amplifies noise when the
  * load is not monotonically changing.  We compute a confidence score based
  * on the absolute difference between the two samples: the smaller the
  * difference, the more we trust the extrapolation.  When confidence is low
- * or the extrapolated value is outside [0, 100], we fall back to the
- * current sample F(h).
+ * or the extrapolated value is outside [0, 100], the delta is treated as
+ * zero (no trend).
  *
- * This result is used ONLY for step-size hinting, never as the primary
- * load value for threshold decisions.
+ * Returns the signed difference between the extrapolated next load and the
+ * current sample (load_h - load_2h).  Positive values suggest an increasing
+ * load trend; negative values suggest a decreasing trend.
+ *
+ * This result is used ONLY for down-threshold timing, and with minimal
+ * strength.  It never enlarges frequency increase steps.
  */
-static int lap_compute_richardson_load(int load_h, int load_2h)
+static int lap_compute_richardson_delta(int load_h, int load_2h)
 {
 	int load_diff;
 	int confidence;
 	int raw_extrap;
-	int result;
+	int raw_delta;
 
 	load_diff = abs(load_h - load_2h);
 	confidence = 100 - min(load_diff, 100);
 
 	raw_extrap = (2 * load_h) - load_2h;
+	raw_delta = load_h - load_2h;
 
 	/* Clamp raw extrapolation; out-of-range values are treated as unreliable */
 	if (raw_extrap < 0 || raw_extrap > 100)
 		confidence = 0;
 
-	if (confidence >= LAP_RICHARDSON_CONFIDENCE_THRESHOLD) {
-		result = raw_extrap;
-	} else {
-		result = load_h;
-	}
+	if (confidence < LAP_RICHARDSON_CONFIDENCE_THRESHOLD)
+		raw_delta = 0;
 
-	return clamp(result, 0, 100);
+	return clamp(raw_delta, -100, 100);
 }
 
 /*
@@ -328,7 +330,7 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
 		u64 idle_delta_h, idle_delta_2h;
 		u64 nice_delta_h, nice_delta_2h;
 		int load_h = 0, load_2h = 0;
-		int extrapolated_load;
+		int richardson_delta;
 		int busy_h, busy_2h;
 
 		cur_idle = get_cpu_idle_time_us(cpu, &cur_time);
@@ -373,10 +375,13 @@ static unsigned int lap_dbs_update(struct cpufreq_policy *policy, bool ignore_ni
 			load_2h = load_h;
 		}
 
-		/* Confidence-weighted Richardson; used only for step hinting */
-		extrapolated_load = lap_compute_richardson_load(load_h, load_2h);
-		max_richardson_delta = max(max_richardson_delta,
-					   extrapolated_load - load_h);
+		/*
+		 * Confidence-weighted Richardson delta; used only for down timing,
+		 * and only when it predicts an increasing load trend.
+		 */
+		richardson_delta = lap_compute_richardson_delta(load_h, load_2h);
+		if (richardson_delta > max_richardson_delta)
+			max_richardson_delta = richardson_delta;
 
 		/* Shift snapshots for next iteration */
 		cdbs->prev2_cpu_idle = cdbs->prev_cpu_idle;
@@ -503,18 +508,6 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 
 	step_khz = lap_get_freq_step_khz(&tuners, policy);
 
-	/*
-	 * Richardson hint: if extrapolation predicts a load spike before the
-	 * next sample, preemptively double the step size (capped at max).
-	 * The threshold decision itself is still based on smoothed_load.
-	 */
-	if (richardson_hint > 0 && (int)lp->smoothed_load + richardson_hint > (int)tuners.up_threshold) {
-		unsigned int max_step_khz = (tuners.max_freq_step_percent * policy->max) / 100;
-		if (max_step_khz == 0)
-			max_step_khz = 1;
-		step_khz = min(step_khz * 2, max_step_khz);
-	}
-
 	/* Compose effective thresholds from base values and dynamic bias */
 	bias = tuners.powersave_bias;
 	if (on_ac) {
@@ -528,6 +521,14 @@ static unsigned long cs_dbs_update(struct cpufreq_policy *policy)
 
 	eff_up = (int)tuners.up_threshold + bias;
 	eff_down = (int)tuners.down_threshold + bias;
+
+	/*
+	 * Richardson hint applied only to down timing and with minimal strength:
+	 * if extrapolation predicts a load increase, raise the effective down
+	 * threshold slightly to avoid premature frequency reductions.
+	 */
+	if (richardson_hint > 0)
+		eff_down += richardson_hint / 20;
 
 	if (eff_up > 100)
 		eff_up = 100;
@@ -1206,7 +1207,7 @@ static int lap_init(struct cpufreq_policy *policy)
 	lp->tuners.sampling_down_factor = LAP_DEF_SAMPLING_DOWN_FAC;
 	lp->tuners.ignore_nice_load = 1;
 	lp->tuners.sampling_rate = LAP_DEF_SAMPLING_RATE;
-	lp->tuners.powersave_bias = 0;
+	lp->tuners.powersave_bias = LAP_DEF_POWERSAVE_BIAS_DEFAULT;
 	lp->tuners.ema_alpha_scaling_factor = LAP_DEF_EMA_ALPHA_SCALING_FACTOR;
 	lp->tuners.system_idle_threshold = LAP_DEF_SYSTEM_IDLE_THRESHOLD;
 	lp->tuners.powersave_bias_ac = LAP_DEF_POWERSAVE_BIAS_DEFAULT;
